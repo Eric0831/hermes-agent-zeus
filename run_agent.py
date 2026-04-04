@@ -78,7 +78,7 @@ from hermes_constants import OPENROUTER_BASE_URL
 # Agent internals extracted to agent/ package for modularity
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY, PLATFORM_HINTS,
-    MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE, SKILLS_GUIDANCE,
+    MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE, SKILLS_GUIDANCE, DELEGATION_GUIDANCE,
 )
 from agent.model_metadata import (
     fetch_model_metadata,
@@ -89,6 +89,13 @@ from agent.model_metadata import (
 from agent.context_compressor import ContextCompressor
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS
+from agent.request_resilience import (
+    classify_api_exception,
+    DuplicateRequestError,
+    RequestDedupeCache,
+    build_request_id,
+    inject_request_id,
+)
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from agent.display import (
     KawaiiSpinner, build_tool_preview as _build_tool_preview,
@@ -573,6 +580,7 @@ class AIAgent:
         self.background_review_callback = None  # Optional sync callback for gateway delivery
         self.skip_context_files = skip_context_files
         self.pass_session_id = pass_session_id
+        self._credential_pool = None  # Set externally via credential pool rotation (#4188)
         self.log_prefix_chars = log_prefix_chars
         self.log_prefix = f"{log_prefix} " if log_prefix else ""
         # Store effective base URL for feature detection (prompt caching, reasoning, etc.)
@@ -618,6 +626,10 @@ class AIAgent:
         self.tool_progress_callback = tool_progress_callback
         self.thinking_callback = thinking_callback
         self.reasoning_callback = reasoning_callback
+        self._request_dedupe = RequestDedupeCache(
+            ttl_seconds=float(os.getenv("HERMES_REQUEST_DEDUPE_TTL", "120")),
+            max_entries=int(os.getenv("HERMES_REQUEST_DEDUPE_MAX", "256")),
+        )
         self._reasoning_deltas_fired = False  # Set by _fire_reasoning_delta, reset per API call
         self.clarify_callback = clarify_callback
         self.step_callback = step_callback
@@ -2562,6 +2574,8 @@ class AIAgent:
             tool_guidance.append(SESSION_SEARCH_GUIDANCE)
         if "skill_manage" in self.valid_tool_names:
             tool_guidance.append(SKILLS_GUIDANCE)
+        if "delegate_task" in self.valid_tool_names:
+            tool_guidance.append(DELEGATION_GUIDANCE)
         if tool_guidance:
             prompt_parts.append(" ".join(tool_guidance))
 
@@ -2648,7 +2662,23 @@ class AIAgent:
         if system_message is not None:
             prompt_parts.append(system_message)
 
-        if self._memory_store:
+        # Memory V2: inject L1 core + L2 working + L3 recall
+        _v2_injected = False
+        try:
+            from agent.memory_v2_runtime import is_memory_v2_available, build_memory_v2_prompt
+            if is_memory_v2_available():
+                _v2_block = build_memory_v2_prompt(
+                    session_id=getattr(self, "session_id", "") or "",
+                    user_message="",  # no user message at prompt build time
+                )
+                if _v2_block:
+                    prompt_parts.append(_v2_block)
+                    _v2_injected = True
+        except Exception as _v2e:
+            logger.debug("Memory V2 prompt injection failed, falling back to V1: %s", _v2e)
+
+        # V1 fallback: MEMORY.md + USER.md (used when V2 not available)
+        if not _v2_injected and self._memory_store:
             if self._memory_enabled:
                 mem_block = self._memory_store.format_for_system_prompt("memory")
                 if mem_block:
@@ -3742,6 +3772,51 @@ class AIAgent:
         self._is_anthropic_oauth = _is_oauth_token(new_token)
         return True
 
+    def _swap_credential(self, entry) -> None:
+        """Swap current credentials with a pool entry. (#4188)"""
+        runtime_key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
+        runtime_base = getattr(entry, "runtime_base_url", None) or getattr(entry, "base_url", None) or self.base_url
+        self.api_key = runtime_key
+        self.base_url = runtime_base.rstrip("/") if isinstance(runtime_base, str) else runtime_base
+        self._client_kwargs["api_key"] = self.api_key
+        self._client_kwargs["base_url"] = self.base_url
+        try:
+            self._replace_primary_openai_client(reason="credential_rotation")
+        except Exception:
+            pass
+
+    def _recover_with_credential_pool(
+        self,
+        *,
+        status_code,
+        has_retried_429: bool,
+    ):
+        """Attempt credential recovery via pool rotation. (#4188)
+        Returns (recovered, has_retried_429).
+        """
+        pool = self._credential_pool
+        if pool is None or status_code is None:
+            return False, has_retried_429
+
+        if status_code == 402:
+            next_entry = pool.mark_exhausted_and_rotate(status_code=402)
+            if next_entry is not None:
+                self._swap_credential(next_entry)
+                return True, False
+        elif status_code == 429:
+            if not has_retried_429:
+                return False, True
+            next_entry = pool.mark_exhausted_and_rotate(status_code=429)
+            if next_entry is not None:
+                self._swap_credential(next_entry)
+                return True, False
+        elif status_code == 401:
+            refreshed = getattr(pool, "try_refresh_current", lambda: None)()
+            if refreshed is not None:
+                self._swap_credential(refreshed)
+                return True, has_retried_429
+        return False, has_retried_429
+
     def _anthropic_messages_create(self, api_kwargs: dict):
         if self.api_mode == "anthropic_messages":
             self._try_refresh_anthropic_client_credentials()
@@ -3756,6 +3831,11 @@ class AIAgent:
         close that worker-local client, so retries and other requests never
         inherit a closed transport.
         """
+        request_id = build_request_id(getattr(self, "model", "unknown"), api_kwargs)
+        dedupe_fingerprint = request_id
+        self._request_dedupe.acquire(dedupe_fingerprint, request_id)
+        api_kwargs = inject_request_id(api_kwargs, request_id)
+        logger.debug("Submitting model request %s model=%s provider=%s", request_id, self.model, self.provider)
         result = {"response": None, "error": None}
         request_client_holder = {"client": None}
 
@@ -3782,31 +3862,36 @@ class AIAgent:
 
         t = threading.Thread(target=_call, daemon=True)
         t.start()
-        while t.is_alive():
-            t.join(timeout=0.3)
-            if self._interrupt_requested:
-                # Force-close the in-flight worker-local HTTP connection to stop
-                # token generation without poisoning the shared client used to
-                # seed future retries.
-                try:
-                    if self.api_mode == "anthropic_messages":
-                        from agent.anthropic_adapter import build_anthropic_client
+        try:
+            while t.is_alive():
+                t.join(timeout=0.3)
+                if self._interrupt_requested:
+                    # Force-close the in-flight worker-local HTTP connection to stop
+                    # token generation without poisoning the shared client used to
+                    # seed future retries.
+                    try:
+                        if self.api_mode == "anthropic_messages":
+                            from agent.anthropic_adapter import build_anthropic_client
 
-                        self._anthropic_client.close()
-                        self._anthropic_client = build_anthropic_client(
-                            self._anthropic_api_key,
-                            getattr(self, "_anthropic_base_url", None),
-                        )
-                    else:
-                        request_client = request_client_holder.get("client")
-                        if request_client is not None:
-                            self._close_request_openai_client(request_client, reason="interrupt_abort")
-                except Exception:
-                    pass
-                raise InterruptedError("Agent interrupted during API call")
-        if result["error"] is not None:
-            raise result["error"]
-        return result["response"]
+                            self._anthropic_client.close()
+                            self._anthropic_client = build_anthropic_client(
+                                self._anthropic_api_key,
+                                getattr(self, "_anthropic_base_url", None),
+                            )
+                        else:
+                            request_client = request_client_holder.get("client")
+                            if request_client is not None:
+                                self._close_request_openai_client(request_client, reason="interrupt_abort")
+                    except Exception:
+                        pass
+                    raise InterruptedError("Agent interrupted during API call")
+            if result["error"] is not None:
+                raise result["error"]
+            self._request_dedupe.complete(dedupe_fingerprint, request_id)
+            return result["response"]
+        except Exception:
+            self._request_dedupe.release(dedupe_fingerprint)
+            raise
 
     # ── Unified streaming API call ─────────────────────────────────────────
 
@@ -4338,13 +4423,28 @@ class AIAgent:
         if not fb_provider or not fb_model:
             return False
 
+        # Pass explicit base_url / api_key from config so local endpoints
+        # (e.g. vLLM on localhost) resolve correctly even when the provider
+        # name isn't in PROVIDER_REGISTRY.
+        fb_base_url_cfg = (fb.get("base_url") or "").strip() or None
+        fb_api_key_cfg = (fb.get("api_key") or "").strip() or None
+
+        # If a custom base_url is provided but provider isn't in the
+        # registry, route through "custom" so resolve_provider_client
+        # uses the explicit endpoint instead of failing lookup.
+        effective_provider = fb_provider
+        if fb_base_url_cfg:
+            effective_provider = "custom"
+
         # Use centralized router for client construction.
         # raw_codex=True because the main agent needs direct responses.stream()
         # access for Codex providers.
         try:
             from agent.auxiliary_client import resolve_provider_client
             fb_client, _ = resolve_provider_client(
-                fb_provider, model=fb_model, raw_codex=True)
+                effective_provider, model=fb_model, raw_codex=True,
+                explicit_base_url=fb_base_url_cfg,
+                explicit_api_key=fb_api_key_cfg)
             if fb_client is None:
                 logging.warning(
                     "Fallback to %s failed: provider not configured",
@@ -6409,6 +6509,7 @@ class AIAgent:
             codex_auth_retry_attempted = False
             anthropic_auth_retry_attempted = False
             nous_auth_retry_attempted = False
+            has_retried_429 = False  # credential pool rotation (#4188)
             restart_with_compressed_messages = False
             restart_with_length_continuation = False
 
@@ -6575,6 +6676,7 @@ class AIAgent:
                                 "messages": messages,
                                 "completed": False,
                                 "api_calls": api_call_count,
+                                "error_code": "invalid_api_response",
                                 "error": "Invalid API response shape. Likely rate limited or malformed provider response.",
                                 "failed": True  # Mark as failure for filtering
                             }
@@ -6938,11 +7040,14 @@ class AIAgent:
                     error_type = type(api_error).__name__
                     error_msg = str(api_error).lower()
                     _error_summary = self._summarize_api_error(api_error)
+                    error_class = classify_api_exception(api_error)
+                    error_code = error_class["code"]
                     logger.warning(
-                        "API call failed (attempt %s/%s) error_type=%s %s summary=%s",
+                        "API call failed (attempt %s/%s) error_type=%s error_code=%s %s summary=%s",
                         retry_count,
                         max_retries,
                         error_type,
+                        error_code,
                         self._client_log_context(),
                         _error_summary,
                     )
@@ -6952,6 +7057,7 @@ class AIAgent:
                     _model = getattr(self, "model", "unknown")
                     _status_code_str = f" [HTTP {status_code}]" if status_code else ""
                     self._vprint(f"{self.log_prefix}⚠️  API call failed (attempt {retry_count}/{max_retries}): {error_type}{_status_code_str}", force=True)
+                    self._vprint(f"{self.log_prefix}   🧾 Error code: {error_code}", force=True)
                     self._vprint(f"{self.log_prefix}   🔌 Provider: {_provider}  Model: {_model}", force=True)
                     self._vprint(f"{self.log_prefix}   🌐 Endpoint: {_base}", force=True)
                     self._vprint(f"{self.log_prefix}   📝 Error: {_error_summary}", force=True)
@@ -6972,6 +7078,7 @@ class AIAgent:
                             "messages": messages,
                             "api_calls": api_call_count,
                             "completed": False,
+                            "error_code": error_code,
                             "interrupted": True,
                         }
                     
@@ -6984,26 +7091,14 @@ class AIAgent:
                     # When a fallback model is configured, switch immediately instead
                     # of burning through retries with exponential backoff -- the
                     # primary provider won't recover within the retry window.
-                    is_rate_limited = (
-                        status_code == 429
-                        or "rate limit" in error_msg
-                        or "too many requests" in error_msg
-                        or "rate_limit" in error_msg
-                        or "usage limit" in error_msg
-                        or "quota" in error_msg
-                    )
+                    is_rate_limited = error_code == "rate_limited"
                     if is_rate_limited and not self._fallback_activated:
                         self._emit_status("⚠️ Rate limited — switching to fallback provider...")
                         if self._try_activate_fallback():
                             retry_count = 0
                             continue
 
-                    is_payload_too_large = (
-                        status_code == 413
-                        or 'request entity too large' in error_msg
-                        or 'payload too large' in error_msg
-                        or 'error code: 413' in error_msg
-                    )
+                    is_payload_too_large = error_code == "payload_too_large"
 
                     if is_payload_too_large:
                         compression_attempts += 1
@@ -7015,6 +7110,7 @@ class AIAgent:
                                 "messages": messages,
                                 "completed": False,
                                 "api_calls": api_call_count,
+                                "error_code": "payload_too_large",
                                 "error": f"Request payload too large: max compression attempts ({max_compression_attempts}) reached.",
                                 "partial": True
                             }
@@ -7039,6 +7135,7 @@ class AIAgent:
                                 "messages": messages,
                                 "completed": False,
                                 "api_calls": api_call_count,
+                                "error_code": "payload_too_large",
                                 "error": "Request payload too large (413). Cannot compress further.",
                                 "partial": True
                             }
@@ -7076,7 +7173,33 @@ class AIAgent:
                                 f"treating as probable context overflow.",
                                 force=True,
                             )
-                    
+
+                    # Server disconnects on large sessions are often caused by
+                    # the request exceeding the provider's context/payload limit
+                    # without a proper HTTP error response.  Treat these as
+                    # context-length errors to trigger compression rather than
+                    # burning through retries that will all fail the same way.
+                    # This breaks the death spiral: disconnect → no token data
+                    # → no compression → bigger session → more disconnects.
+                    # (#2153)
+                    if not is_context_length_error and not status_code:
+                        _is_server_disconnect = (
+                            'server disconnected' in error_msg
+                            or 'peer closed connection' in error_msg
+                            or error_type in ('ReadError', 'RemoteProtocolError', 'ServerDisconnectedError')
+                        )
+                        if _is_server_disconnect:
+                            ctx_len = getattr(getattr(self, 'context_compressor', None), 'context_length', 200000)
+                            _is_large = approx_tokens > ctx_len * 0.6 or len(api_messages) > 200
+                            if _is_large:
+                                is_context_length_error = True
+                                self._vprint(
+                                    f"{self.log_prefix}⚠️  Server disconnected with large session "
+                                    f"(~{approx_tokens:,} tokens, {len(api_messages)} msgs) — "
+                                    f"treating as context-length error, attempting compression.",
+                                    force=True,
+                                )
+
                     if is_context_length_error:
                         compressor = self.context_compressor
                         old_ctx = compressor.context_length
@@ -7115,6 +7238,7 @@ class AIAgent:
                                 "messages": messages,
                                 "completed": False,
                                 "api_calls": api_call_count,
+                                "error_code": "context_length_exceeded",
                                 "error": f"Context length exceeded: max compression attempts ({max_compression_attempts}) reached.",
                                 "partial": True
                             }
@@ -7142,6 +7266,7 @@ class AIAgent:
                                 "messages": messages,
                                 "completed": False,
                                 "api_calls": api_call_count,
+                                "error_code": "context_length_exceeded",
                                 "error": f"Context length exceeded ({approx_tokens:,} tokens). Cannot compress further.",
                                 "partial": True
                             }
@@ -7157,10 +7282,6 @@ class AIAgent:
                     # Exclude UnicodeEncodeError — it's a ValueError subclass but is
                     # handled separately by the surrogate sanitization path above.
                     _RETRYABLE_STATUS_CODES = {413, 429, 529}
-                    is_local_validation_error = (
-                        isinstance(api_error, (ValueError, TypeError))
-                        and not isinstance(api_error, UnicodeEncodeError)
-                    )
                     # Detect generic 400s from Anthropic OAuth (transient server-side failures).
                     # Real invalid_request_error responses include a descriptive message;
                     # transient ones contain only "Error" or are empty. (ref: issue #1608)
@@ -7168,13 +7289,24 @@ class AIAgent:
                     _err_message = (_err_body.get("error", {}).get("message", "") if isinstance(_err_body, dict) else "")
                     _is_generic_400 = (status_code == 400 and _err_message.strip().lower() in ("error", ""))
                     is_client_status_error = isinstance(status_code, int) and 400 <= status_code < 500 and status_code not in _RETRYABLE_STATUS_CODES and not _is_generic_400
-                    is_client_error = (is_local_validation_error or is_client_status_error or any(phrase in error_msg for phrase in [
-                        'error code: 401', 'error code: 403',
-                        'error code: 404', 'error code: 422',
-                        'is not a valid model', 'invalid model', 'model not found',
-                        'invalid api key', 'invalid_api_key', 'authentication',
-                        'unauthorized', 'forbidden', 'not found',
-                    ])) and not is_context_length_error
+                    is_client_error = (
+                        error_code in {
+                            "provider_4xx_non_retryable",
+                            "local_validation_error",
+                            "schema_validation_failed",
+                            "duplicate_request_suppressed",
+                        }
+                        or (
+                            is_client_status_error
+                            or any(phrase in error_msg for phrase in [
+                                'error code: 401', 'error code: 403',
+                                'error code: 404', 'error code: 422',
+                                'is not a valid model', 'invalid model', 'model not found',
+                                'invalid api key', 'invalid_api_key', 'authentication',
+                                'unauthorized', 'forbidden', 'not found',
+                            ])
+                        )
+                    ) and not is_context_length_error
 
                     if is_client_error:
                         # Try fallback before aborting — a different provider
@@ -7218,6 +7350,7 @@ class AIAgent:
                             "api_calls": api_call_count,
                             "completed": False,
                             "failed": True,
+                            "error_code": error_code,
                             "error": str(api_error),
                         }
 
@@ -7285,6 +7418,7 @@ class AIAgent:
                             "api_calls": api_call_count,
                             "completed": False,
                             "failed": True,
+                            "error_code": error_code,
                             "error": _final_summary,
                         }
 

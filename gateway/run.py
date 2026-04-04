@@ -79,6 +79,92 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from hermes_constants import get_hermes_home
 _hermes_home = get_hermes_home()
 
+_SHARED_HERMES_HOME = Path("/home/testai/.hermes").resolve()
+_MARKET_AGENT_NAMES = (
+    "ocean",
+    "eleven",
+    "wilson",
+    "susan",
+    "crypto",
+)
+_MARKET_DOMAIN_TERMS = (
+    "twse",
+    "tpex",
+    "taiex",
+    "台股",
+    "台指",
+    "台指期",
+    "美股",
+    "global futures",
+    "海外期貨",
+    "加密貨幣",
+    "perpetual",
+    "perp",
+)
+_MARKET_COGNITION_TERMS = (
+    "agenteos",
+    "memory",
+    "precedent",
+    "policy",
+    "doctrine",
+    "reflection",
+    "meta-learning",
+    "learning",
+    "runtime",
+    "live",
+    "research",
+    "evolution",
+    "strategy",
+    "risk",
+    "execution",
+    "broker",
+    "交易",
+    "風控",
+    "研究",
+    "進化",
+    "策略",
+    "記憶",
+    "前例",
+    "政策",
+    "教義",
+    "反思",
+    "執行",
+)
+
+
+def _shared_gateway_operator_only() -> bool:
+    try:
+        return _hermes_home.resolve() == _SHARED_HERMES_HOME
+    except Exception:
+        return str(_hermes_home) == str(_SHARED_HERMES_HOME)
+
+
+def _should_reject_market_request_for_shared_gateway(text: str) -> bool:
+    if not _shared_gateway_operator_only():
+        return False
+    lowered = (text or "").strip().lower()
+    if not lowered:
+        return False
+    has_agent_name = any(term in lowered for term in _MARKET_AGENT_NAMES)
+    has_market_domain = any(term in lowered for term in _MARKET_DOMAIN_TERMS)
+    has_cognition_term = any(term in lowered for term in _MARKET_COGNITION_TERMS)
+    # Reject explicit agent mentions immediately. Otherwise require both
+    # a market-domain signal and a sovereign-function signal.
+    return has_agent_name or (has_market_domain and has_cognition_term)
+
+
+def _shared_gateway_reject_message() -> str:
+    return (
+        "共享 ~/.hermes gateway 現在是 operator-only，不能承接市場代理任務或 AgentEOS 認知。\n\n"
+        "請改用對應本地 home：\n"
+        "- OCEAN -> ~/.hermes-ocean\n"
+        "- ELEVEN -> ~/.hermes-eleven\n"
+        "- WILSON -> ~/.hermes-wilson\n"
+        "- SUSAN -> ~/.hermes-susan\n"
+        "- CRYPTO -> ~/.hermes-crypto\n\n"
+        "被拒收範圍包含：runtime、live、research/evolution、strategy、risk、memory、precedent、policy、doctrine、reflection、meta-learning。"
+    )
+
 # Load environment variables from ~/.hermes/.env first.
 # User-managed env files should override stale shell exports on restart.
 from dotenv import load_dotenv  # backward-compat for tests that monkeypatch this symbol
@@ -223,6 +309,7 @@ from gateway.session import (
 )
 from gateway.delivery import DeliveryRouter
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
+from gateway.runtime_metadata import collect_runtime_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -231,6 +318,20 @@ logger = logging.getLogger(__name__)
 # session from bypassing the "already running" guard during the async gap
 # between the guard check and actual agent creation.
 _AGENT_PENDING_SENTINEL = object()
+
+
+def _log_runtime_metadata(metadata: dict[str, str]) -> None:
+    logger.info(
+        "Gateway runtime fingerprint | git_sha=%s config_hash=%s prompt_version=%s model=%s",
+        metadata.get("git_sha", "unknown"),
+        metadata.get("config_hash", "unknown"),
+        metadata.get("prompt_version", "unknown"),
+        metadata.get("model_name", "unknown"),
+    )
+
+
+def _utc_now_iso() -> str:
+    return datetime.utcnow().isoformat() + "Z"
 
 
 def _resolve_runtime_agent_kwargs() -> dict:
@@ -543,6 +644,35 @@ class GatewayRunner:
         Synchronous worker — meant to be called via run_in_executor from
         an async context so it doesn't block the event loop.
         """
+        # Memory V2: persist session summary + rollover working memory
+        try:
+            from agent.memory_v2_runtime import (
+                is_memory_v2_available,
+                persist_session_summary,
+                rollover_working_memory,
+                load_working_memory,
+            )
+            if is_memory_v2_available() and old_session_id:
+                # Build lightweight summary from working memory
+                wm = load_working_memory(old_session_id)
+                agent_id = Path(get_hermes_home()).name.replace(".hermes-", "").replace(".hermes", "main")
+                summary_data = {
+                    "topic": wm.get("current_task", "")[:100] or agent_id,
+                    "summary": f"Task: {wm.get('current_task', 'N/A')}. "
+                               f"Decisions: {', '.join(wm.get('recent_decisions', [])[:3])}. "
+                               f"Open: {', '.join(wm.get('open_loops', [])[:3])}.",
+                    "outcome": ", ".join(wm.get("recent_decisions", [])[:2]),
+                    "open_loops": wm.get("open_loops", []),
+                    "files": [],
+                    "tags": [agent_id],
+                    "message_count": 0,
+                    "stable_facts_candidate": wm.get("stable_facts_candidate", []),
+                }
+                persist_session_summary(agent_id, old_session_id, summary_data)
+                logger.info("Memory V2: persisted summary for session %s", old_session_id)
+        except Exception as _v2_flush_err:
+            logger.debug("Memory V2 flush failed: %s", _v2_flush_err)
+
         # Skip cron sessions — they run headless with no meaningful user
         # conversation to extract memories from.
         if old_session_id and old_session_id.startswith("cron_"):
@@ -959,9 +1089,15 @@ class GatewayRunner:
         """
         logger.info("Starting Hermes Gateway...")
         logger.info("Session storage: %s", self.config.sessions_dir)
+        runtime_metadata = collect_runtime_metadata()
+        _log_runtime_metadata(runtime_metadata)
         try:
             from gateway.status import write_runtime_status
-            write_runtime_status(gateway_state="starting", exit_reason=None)
+            write_runtime_status(
+                gateway_state="starting",
+                exit_reason=None,
+                runtime_metadata=runtime_metadata,
+            )
         except Exception:
             pass
         
@@ -1076,7 +1212,11 @@ class GatewayRunner:
                 logger.error("Gateway hit a non-retryable startup conflict: %s", reason)
                 try:
                     from gateway.status import write_runtime_status
-                    write_runtime_status(gateway_state="startup_failed", exit_reason=reason)
+                    write_runtime_status(
+                        gateway_state="startup_failed",
+                        exit_reason=reason,
+                        runtime_metadata=runtime_metadata,
+                    )
                 except Exception:
                     pass
                 self._request_clean_exit(reason)
@@ -1086,7 +1226,11 @@ class GatewayRunner:
                 logger.error("Gateway failed to connect any configured messaging platform: %s", reason)
                 try:
                     from gateway.status import write_runtime_status
-                    write_runtime_status(gateway_state="startup_failed", exit_reason=reason)
+                    write_runtime_status(
+                        gateway_state="startup_failed",
+                        exit_reason=reason,
+                        runtime_metadata=runtime_metadata,
+                    )
                 except Exception:
                     pass
                 return False
@@ -1099,7 +1243,11 @@ class GatewayRunner:
         self._running = True
         try:
             from gateway.status import write_runtime_status
-            write_runtime_status(gateway_state="running", exit_reason=None)
+            write_runtime_status(
+                gateway_state="running",
+                exit_reason=None,
+                runtime_metadata=runtime_metadata,
+            )
         except Exception:
             pass
         
@@ -1733,7 +1881,10 @@ class GatewayRunner:
         
         if canonical == "status":
             return await self._handle_status_command(event)
-        
+
+        if canonical == "tasks":
+            return await self._handle_tasks_command(event)
+
         if canonical == "stop":
             return await self._handle_stop_command(event)
         
@@ -1915,6 +2066,14 @@ class GatewayRunner:
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str):
         """Inner handler that runs under the _running_agents sentinel guard."""
+
+        if _should_reject_market_request_for_shared_gateway(getattr(event, "text", "")):
+            logger.info(
+                "[Gateway] Rejected market-agent request on shared operator-only home: platform=%s user=%s",
+                source.platform.value if source.platform else "",
+                source.user_id,
+            )
+            return _shared_gateway_reject_message()
 
         # Get or create session
         session_entry = self.session_store.get_or_create_session(source)
@@ -2159,7 +2318,18 @@ class GatewayRunner:
                     # 85% * 1.4 = 119% of context — which exceeds the model's limit
                     # and prevented hygiene from ever firing for ~200K models (GLM-5).
 
-                _needs_compress = _approx_tokens >= _compress_token_threshold
+                # Hard safety valve: force compression if message count is
+                # extreme, regardless of token estimates.  This breaks the
+                # death spiral where API disconnects prevent token data
+                # collection, which prevents compression, which causes more
+                # disconnects.  400 messages is well above normal sessions
+                # but catches runaway growth before it becomes unrecoverable.
+                # (#2153)
+                _HARD_MSG_LIMIT = 400
+                _needs_compress = (
+                    _approx_tokens >= _compress_token_threshold
+                    or _msg_count >= _HARD_MSG_LIMIT
+                )
 
                 if _needs_compress:
                     logger.info(
@@ -2498,16 +2668,50 @@ class GatewayRunner:
                 except Exception as exc:
                     logger.debug("@ context reference expansion failed: %s", exc)
 
-            # Run the agent
-            agent_result = await self._run_agent(
-                message=message_text,
-                context_prompt=context_prompt,
-                history=history,
-                source=source,
-                session_id=session_entry.session_id,
-                session_key=session_key,
-                event_message_id=event.message_id,
-            )
+            # ═══ AgentEOS Brain: Executive Triage ═════════════════════
+            # Decide whether this message should create a structured task
+            # (with planning + verification) or just get a direct LLM reply.
+            _brain_task_result = None
+            try:
+                from brain.config import is_brain_enabled
+                if is_brain_enabled():
+                    from brain.executive import triage as _brain_triage
+                    _triage = _brain_triage(
+                        message_text,
+                        has_media=bool(getattr(event, 'media_urls', None)),
+                        session_history_len=len(history),
+                    )
+                    if _triage.decision == "create_task":
+                        _brain_task_result = await self._run_agent_with_brain_task(
+                            message_text=message_text,
+                            context_prompt=context_prompt,
+                            history=history,
+                            source=source,
+                            session_entry=session_entry,
+                            session_key=session_key,
+                            event=event,
+                            triage_result=_triage,
+                        )
+            except Exception as _brain_exc:
+                logger.warning(
+                    "AgentEOS brain triage/task failed (%s), falling back to direct path",
+                    _brain_exc,
+                )
+            # ═══════════════════════════════════════════════════════════
+
+            # Run the agent (direct path, or if brain task path failed/skipped)
+            if _brain_task_result is not None:
+                agent_result = _brain_task_result
+            else:
+                agent_result = await self._run_agent(
+                    message=message_text,
+                    context_prompt=context_prompt,
+                    history=history,
+                    source=source,
+                    session_id=session_entry.session_id,
+                    session_key=session_key,
+                    event_message_id=event.message_id,
+                )
 
             # Stop persistent typing indicator now that the agent is done
             try:
@@ -2935,8 +3139,480 @@ class GatewayRunner:
             f"**Connected Platforms:** {', '.join(connected_platforms)}",
         ]
         
+        # ── Brain metrics ──
+        try:
+            from brain.config import is_brain_enabled
+            if is_brain_enabled() and self._session_db is not None:
+                from brain.task_store import get_task_stats
+                db = self._session_db
+                stats = get_task_stats(db, session_entry.session_id)
+                if stats["total"] > 0:
+                    lines.append("")
+                    lines.append("**Brain Tasks:**")
+                    lines.append(
+                        f"  completed: {stats['completed']} | "
+                        f"failed: {stats['failed']} | "
+                        f"active: {stats['total'] - stats['completed'] - stats['failed'] - stats['cancelled']}"
+                    )
+        except Exception:
+            pass
+
         return "\n".join(lines)
-    
+
+    async def _handle_tasks_command(self, event: MessageEvent) -> str:
+        """Handle /tasks [task_id] — list or inspect brain-tracked tasks."""
+        source = event.source
+        session_entry = self.session_store.get_or_create_session(source)
+        args = event.get_command_args().strip() if hasattr(event, 'get_command_args') else ""
+
+        try:
+            from brain.config import is_brain_enabled
+            if not is_brain_enabled():
+                return "Brain task tracking is disabled. Enable with `brain.enabled: true` in config.yaml."
+
+            from brain import task_store, evidence as brain_evidence
+            db = self._session_db
+
+            # /tasks metrics — show brain KPIs
+            if args == "metrics":
+                from brain.metrics import get_brain_metrics, format_metrics_text
+                m = get_brain_metrics(db, session_entry.session_id)
+                return "**Brain Metrics**\n\n" + format_metrics_text(m)
+
+            # /tasks world — show world state
+            if args == "world":
+                from brain.world_state import get_world_state_summary
+                summary = get_world_state_summary(db, session_entry.session_id)
+                return "**World State**\n\n" + summary
+
+            # /tasks evolve — run meta-learning + pattern mining
+            if args == "evolve":
+                try:
+                    from brain.meta_learning import execute_run
+                    from brain.pattern_mining import mine_patterns
+                    result = execute_run(db, scope_id=session_entry.session_id)
+                    lines = [
+                        f"**Meta-Learning Run** `{result['run_id']}`",
+                        f"Tasks analyzed: {result['tasks_analyzed']}",
+                        f"Findings: {len(result.get('findings', []))}",
+                    ]
+                    for f in result.get("findings", [])[:5]:
+                        lines.append(f"  - [{f['type']}] {f.get('suggestion', f.get('detail', ''))}"[:120])
+                    return "\n".join(lines)
+                except Exception as e:
+                    return f"Meta-learning failed: {e}"
+
+            # /tasks proactive — check for proactive signals
+            if args == "proactive":
+                try:
+                    from brain.proactive import evaluate_signals, format_nudge
+                    actions = evaluate_signals(db, session_entry.session_id)
+                    if not actions:
+                        return "No proactive signals detected."
+                    lines = ["**Proactive Signals**", ""]
+                    for a in actions[:5]:
+                        lines.append(format_nudge(a))
+                    return "\n".join(lines)
+                except Exception as e:
+                    return f"Proactive scan failed: {e}"
+
+            # /tasks propose [family] — generate capability proposals
+            if args.startswith("propose"):
+                try:
+                    from brain.evolution_architect import generate_proposals
+                    family = args.split(None, 1)[1].strip() if " " in args else None
+                    pids = generate_proposals(db, family)
+                    if not pids:
+                        return "No capability gaps found — nothing to propose."
+                    from brain.evolution_architect import get_proposal
+                    lines = [f"**Generated {len(pids)} Capability Proposals**", ""]
+                    for pid in pids[:5]:
+                        p = get_proposal(db, pid)
+                        if p:
+                            lines.append(f"  `{pid}` [{p['proposal_type']}] {p['title'][:80]}")
+                    return "\n".join(lines)
+                except Exception as e:
+                    return f"Proposal generation failed: {e}"
+
+            # /tasks capabilities — list capability versions
+            if args == "capabilities":
+                try:
+                    from brain.capability_manager import get_capability_stats
+                    stats = get_capability_stats(db)
+                    if not stats:
+                        return "No capabilities registered yet."
+                    lines = ["**Capability Registry**", ""]
+                    for status, count in sorted(stats.items()):
+                        lines.append(f"  {status}: {count}")
+                    return "\n".join(lines)
+                except Exception as e:
+                    return f"Capability listing failed: {e}"
+
+            # /tasks reflect [family] — recursive reflection
+            if args.startswith("reflect"):
+                try:
+                    from brain.recursive_reflection import reflect_on_capability, reflect_on_architecture
+                    family = args.split(None, 1)[1].strip() if " " in args else None
+                    if family:
+                        r = reflect_on_capability(db, family)
+                        lines = [
+                            f"**Capability Reflection: {family}**",
+                            f"Effectiveness: {r.get('effectiveness_score', 0):.0%}",
+                            f"Should evolve: {'Yes' if r.get('should_evolve') else 'No'}",
+                        ]
+                        for s in r.get("strengths", [])[:3]:
+                            lines.append(f"  + {s}")
+                        for w in r.get("weaknesses", [])[:3]:
+                            lines.append(f"  - {w}")
+                    else:
+                        r = reflect_on_architecture(db)
+                        lines = [
+                            "**Architecture Reflection**",
+                            f"Healthy families: {', '.join(r.get('healthy_families', [])) or 'none'}",
+                            f"Struggling: {', '.join(r.get('struggling_families', [])) or 'none'}",
+                        ]
+                        for rec in r.get("evolution_recommendations", [])[:3]:
+                            lines.append(f"  > {rec}")
+                    return "\n".join(lines)
+                except Exception as e:
+                    return f"Reflection failed: {e}"
+
+            # /tasks doctrines — list active doctrines
+            if args == "doctrines":
+                try:
+                    from brain.doctrine_engine import get_active_doctrines, get_doctrine_stats
+                    doctrines = get_active_doctrines(db)
+                    stats = get_doctrine_stats(db)
+                    if not doctrines and stats.get("total", 0) == 0:
+                        return "No doctrines registered yet."
+                    lines = [f"**Doctrines** ({stats.get('ratified', 0)} ratified)", ""]
+                    for d in doctrines[:10]:
+                        lines.append(f"  [{d['domain']}] {d['doctrine_name']} (v{d['version']})")
+                    return "\n".join(lines)
+                except Exception as e:
+                    return f"Doctrine listing failed: {e}"
+
+            # /tasks deliberate <subject> — open deliberation session
+            if args.startswith("deliberate "):
+                try:
+                    from brain.deliberation import open_session, get_session
+                    subject = args.split(None, 1)[1].strip()
+                    sid = open_session(db, "reform_debate", "proposal", subject)
+                    return f"Deliberation session opened: `{sid}`\nSubject: {subject}\nUse agent clusters to submit positions."
+                except Exception as e:
+                    return f"Deliberation failed: {e}"
+
+            # /tasks culture — analyze cultural health
+            if args == "culture":
+                try:
+                    from brain.cultural_stability import analyze_culture
+                    result = analyze_culture(db)
+                    lines = [
+                        f"**Cultural Health:** {result.get('health_score', 0):.0%}",
+                    ]
+                    for p in result.get("pathologies", [])[:3]:
+                        lines.append(f"  ⚠ {p.get('type', '?')}: {p.get('description', '')[:80]}")
+                    if not result.get("pathologies"):
+                        lines.append("  No pathologies detected.")
+                    for r in result.get("recommendations", [])[:3]:
+                        lines.append(f"  > {r}")
+                    return "\n".join(lines)
+                except Exception as e:
+                    return f"Culture analysis failed: {e}"
+
+            # /tasks civilization — civilization health overview
+            if args == "civilization":
+                try:
+                    from brain.civilization_planner import get_health_snapshot
+                    h = get_health_snapshot(db)
+                    lines = ["**Civilization Health**", ""]
+                    for k, v in h.items():
+                        if isinstance(v, float):
+                            lines.append(f"  {k}: {v:.0%}")
+                        elif isinstance(v, list):
+                            lines.append(f"  {k}: {len(v)} items")
+                        else:
+                            lines.append(f"  {k}: {v}")
+                    return "\n".join(lines)
+                except Exception as e:
+                    return f"Civilization health failed: {e}"
+
+            # /tasks epoch — show current epoch
+            if args == "epoch":
+                try:
+                    from brain.epoch_manager import get_current_epoch, get_epoch_history
+                    current = get_current_epoch(db)
+                    if not current:
+                        return "No active epoch. Use `/tasks epoch new <name>` to create one."
+                    import time as _t
+                    lines = [
+                        f"**Current Epoch:** `{current['id']}`",
+                        f"  Name: {current['epoch_name']}",
+                        f"  Started: {_t.strftime('%Y-%m-%d %H:%M', _t.localtime(current['started_at']))}",
+                    ]
+                    history = get_epoch_history(db, limit=5)
+                    if len(history) > 1:
+                        lines.append(f"\n**Recent Epochs:** {len(history)}")
+                        for e in history[1:4]:
+                            lines.append(f"  {e['epoch_name']} [{e['status']}]")
+                    return "\n".join(lines)
+                except Exception as e:
+                    return f"Epoch query failed: {e}"
+
+            # /tasks epoch new <name>
+            if args.startswith("epoch new "):
+                try:
+                    from brain.epoch_manager import create_epoch
+                    name = args.split("epoch new ", 1)[1].strip()
+                    eid = create_epoch(db, name)
+                    return f"New epoch created: `{eid}` — {name}"
+                except Exception as e:
+                    return f"Epoch creation failed: {e}"
+
+            # /tasks existential — scan existential risks
+            if args == "existential":
+                try:
+                    from brain.existential_cortex import scan_risks
+                    risks = scan_risks(db)
+                    if not risks:
+                        return "No existential risks detected."
+                    lines = ["**Existential Risk Scan**", ""]
+                    for r in risks[:5]:
+                        lines.append(f"  [{r.get('severity', '?')}] {r.get('risk_type', '?')}: {r.get('description', '')[:80]}")
+                    return "\n".join(lines)
+                except Exception as e:
+                    return f"Existential scan failed: {e}"
+
+            # /tasks continuity — check identity continuity
+            if args == "continuity":
+                try:
+                    from brain.identity_continuity import get_proofs_for_subject
+                    from brain.epoch_manager import get_current_epoch
+                    current = get_current_epoch(db)
+                    if not current:
+                        return "No active epoch — cannot assess continuity."
+                    proofs = get_proofs_for_subject(db, "epoch", current["id"])
+                    if not proofs:
+                        return f"No continuity proofs for epoch `{current['epoch_name']}`."
+                    lines = [f"**Continuity Proofs for {current['epoch_name']}**", ""]
+                    for p in proofs[:5]:
+                        lines.append(f"  `{p['id']}` score={p['continuity_score']:.2f} verdict={p['verdict']}")
+                    return "\n".join(lines)
+                except Exception as e:
+                    return f"Continuity check failed: {e}"
+
+            # /tasks resume <task_id> — retry a failed task
+            if args.startswith("resume "):
+                resume_tid = args.split(None, 1)[1].strip()
+                return await self._handle_task_resume(db, session_entry, source, event, resume_tid)
+
+            # /tasks <task_id> — show task details
+            if args and args.startswith("task_"):
+                task = task_store.get_task_with_details(db, args)
+                if not task:
+                    return f"Task `{args}` not found."
+
+                import time as _t
+                lines = [
+                    f"**Task:** `{task['id']}`",
+                    f"**Type:** {task['task_type']} | **Status:** {task['status']}",
+                    f"**Goal:** {task['goal'][:200]}",
+                    f"**Priority:** {task['priority']} | **Risk:** {task['risk_level']}",
+                ]
+                if task.get("started_at"):
+                    lines.append(f"**Started:** {_t.strftime('%H:%M:%S', _t.localtime(task['started_at']))}")
+                if task.get("completed_at"):
+                    elapsed = task["completed_at"] - (task.get("started_at") or task["created_at"])
+                    lines.append(f"**Duration:** {elapsed:.1f}s")
+                if task.get("verification_status"):
+                    lines.append(f"**Verification:** {task['verification_status']}")
+                if task.get("failure_reason"):
+                    lines.append(f"**Failure:** {task['failure_reason'][:200]}")
+
+                # Criteria
+                if task.get("criteria"):
+                    lines.append("")
+                    lines.append("**Criteria:**")
+                    for c in task["criteria"]:
+                        icon = "✓" if c["status"] == "met" else "✗" if c["status"] == "unmet" else "○"
+                        lines.append(f"  {icon} {c['description'][:100]}")
+
+                # Evidence count
+                lines.append(f"\n**Evidence:** {task['evidence_count']} records")
+
+                # Transitions
+                if task.get("transitions"):
+                    lines.append("")
+                    lines.append("**Lifecycle:**")
+                    for t in task["transitions"][-5:]:
+                        lines.append(f"  {t['from_state']} → {t['to_state']} ({t.get('reason', '')})")
+
+                return "\n".join(lines)
+
+            # /tasks — list all tasks for this session
+            tasks = task_store.get_session_tasks(db, session_entry.session_id, limit=20)
+            if not tasks:
+                return "No brain-tracked tasks in this session.\n\nTasks are created automatically when you send complex requests (research, coding, summaries)."
+
+            stats = task_store.get_task_stats(db, session_entry.session_id)
+            lines = [
+                f"**Brain Tasks** ({stats['total']} total | "
+                f"{stats['completed']} done | {stats['failed']} failed)",
+                "",
+            ]
+            for t in tasks:
+                status_icon = {
+                    "completed": "✓",
+                    "failed": "✗",
+                    "running": "⚡",
+                    "planned": "📋",
+                    "verifying": "🔍",
+                    "received": "○",
+                    "triaged": "○",
+                    "cancelled": "—",
+                }.get(t["status"], "?")
+                goal_short = t["goal"][:60] + ("..." if len(t["goal"]) > 60 else "")
+                lines.append(f"{status_icon} `{t['id']}` [{t['task_type']}] {goal_short}")
+
+            lines.append("\nUse `/tasks <task_id>` for details.")
+            return "\n".join(lines)
+
+        except Exception as e:
+            logger.warning("Failed to handle /tasks command: %s", e)
+            return f"Error loading tasks: {e}"
+
+    async def _handle_task_resume(self, db, session_entry, source, event, task_id: str) -> str:
+        """Resume a failed or blocked task by re-running it with its original plan."""
+        from brain import task_store
+        from brain.models import TriageResult
+
+        task = task_store.get_task(db, task_id)
+        if not task:
+            return f"Task `{task_id}` not found."
+
+        if task["status"] not in ("failed", "blocked"):
+            return (
+                f"Task `{task_id}` is in status `{task['status']}` — "
+                "only `failed` or `blocked` tasks can be resumed."
+            )
+
+        if task["session_id"] != session_entry.session_id:
+            return "This task belongs to a different session."
+
+        try:
+            # Check retry budget before resuming
+            retry_count, max_retries = task_store.increment_retry(db, task_id)
+            if retry_count > max_retries + 1:  # +1 for manual resume allowance
+                return (
+                    f"Task `{task_id}` has exceeded its retry limit "
+                    f"({retry_count - 1}/{max_retries}). "
+                    "Consider creating a new task instead."
+                )
+
+            # Transition back to running
+            task_store.update_task_status(db, task_id, "running", reason="manual_resume")
+
+            # Rebuild the triage result from the stored task
+            triage_result = TriageResult(
+                decision="create_task",
+                reason="manual_resume",
+                task_type=task["task_type"],
+                priority=task["priority"],
+                risk_level=task["risk_level"],
+                requires_approval=bool(task.get("requires_approval")),
+            )
+
+            # Load plan context
+            plan_context = ""
+            if task.get("plan_json"):
+                import json as _json
+                plan_data = _json.loads(task["plan_json"])
+                criteria = plan_data.get("success_criteria", [])
+                plan_context = (
+                    f"\n\n[RESUMED TASK — id: {task_id}]\n"
+                    f"Goal: {plan_data.get('goal', task['goal'])}\n"
+                    f"Previous attempt failed: {task.get('failure_reason', 'unknown')}\n"
+                    f"Success criteria:\n"
+                    + "\n".join(f"  {i+1}. {c}" for i, c in enumerate(criteria))
+                    + "\n\nPlease address all criteria. This is a retry."
+                )
+
+            # Build context and run
+            session_key = session_entry.session_key
+            from gateway.session import build_session_context, build_session_context_prompt
+            context = build_session_context(source, self.config, session_entry)
+            context_prompt = build_session_context_prompt(context) + plan_context
+            history = self.session_store.load_transcript(session_entry.session_id)
+
+            agent_result = await self._run_agent(
+                message=f"[Resuming task: {task['goal']}]",
+                context_prompt=context_prompt,
+                history=history,
+                source=source,
+                session_id=session_entry.session_id,
+                session_key=session_key,
+                event_message_id=getattr(event, 'message_id', None),
+            )
+
+            # Capture evidence
+            from brain import evidence as brain_evidence
+            for msg in agent_result.get("messages", []):
+                if msg.get("role") in ("tool", "function") and msg.get("content"):
+                    try:
+                        brain_evidence.capture_from_tool_result(
+                            task_id,
+                            tool_name=msg.get("tool_name") or msg.get("name", "unknown"),
+                            tool_call_id=msg.get("tool_call_id", ""),
+                            output=msg.get("content", ""),
+                            db=db,
+                        )
+                    except Exception:
+                        pass
+
+            final_response = agent_result.get("final_response", "")
+            if final_response:
+                try:
+                    brain_evidence.capture_from_response(task_id, final_response, db)
+                except Exception:
+                    pass
+
+            # Verify
+            from brain.verifier import verify_task
+            task_store.update_task_status(db, task_id, "verifying", reason="resume_verify")
+            criteria = task_store.get_criteria(db, task_id)
+            ev = brain_evidence.get_evidence_for_task(task_id, db)
+            import json as _json
+            plan_data = _json.loads(task["plan_json"]) if task.get("plan_json") else {}
+
+            vr = verify_task(
+                goal=plan_data.get("goal", task["goal"]),
+                criteria=criteria,
+                evidence=ev,
+                final_response=final_response,
+            )
+
+            final_status = "completed" if vr.status == "pass" else "failed"
+            task_store.update_task_status(
+                db, task_id, final_status,
+                reason=f"resume_verification_{vr.status}",
+                verification_status=vr.status,
+                verification_json=_json.dumps(vr.to_dict(), ensure_ascii=False),
+            )
+            logger.info("[Brain] Resumed task %s: %s", task_id, final_status)
+
+            return final_response or f"Task resumed and {final_status}."
+
+        except Exception as e:
+            logger.error("Task resume failed: %s", e)
+            try:
+                task_store.update_task_status(
+                    db, task_id, "failed",
+                    failure_reason=f"Resume failed: {e}",
+                )
+            except Exception:
+                pass
+            return f"Failed to resume task: {e}"
+
     async def _handle_stop_command(self, event: MessageEvent) -> str:
         """Handle /stop command - interrupt a running agent.
 
@@ -4905,6 +5581,319 @@ class GatewayRunner:
             with _lock:
                 self._agent_cache.pop(session_key, None)
 
+    # ═══ AgentEOS Brain: Task-Tracked Agent Execution ══════════════
+    async def _run_agent_with_brain_task(
+        self,
+        message_text: str,
+        context_prompt: str,
+        history: list,
+        source,
+        session_entry,
+        session_key: str,
+        event,
+        triage_result,
+    ) -> dict:
+        """
+        Run agent with structured task tracking: Plan → Execute → Verify.
+
+        Creates a task in the DB, generates a plan with success criteria,
+        injects plan context into the system prompt, runs the agent,
+        captures evidence from tool outputs, and verifies completion.
+
+        Falls back gracefully — if any brain component fails, the caller
+        catches the exception and falls through to the normal direct path.
+        """
+        import json as _json
+        from brain import task_store, evidence as brain_evidence
+        from brain.planner import generate_plan
+        from brain.verifier import verify_task
+
+        db = self._session_db
+        if db is None:
+            raise RuntimeError("SessionDB not available — cannot track tasks")
+        session_id = session_entry.session_id
+
+        # 1. Create task
+        task_id = task_store.create_task(
+            db, session_id,
+            goal=message_text[:2000],
+            event_text=message_text[:2000],
+            task_type=triage_result.task_type,
+            priority=triage_result.priority,
+            risk_level=triage_result.risk_level,
+            requires_approval=triage_result.requires_approval,
+        )
+        task_store.update_task_status(db, task_id, "triaged", reason="executive_triage")
+        logger.info("[Brain] Task %s created: type=%s risk=%s",
+                     task_id, triage_result.task_type, triage_result.risk_level)
+
+        # 2. Generate plan
+        plan = generate_plan(
+            goal=message_text,
+            task_type=triage_result.task_type,
+            llm_call=self._brain_planner_llm_call(),
+        )
+        task_store.update_task_status(
+            db, task_id, "planned",
+            reason="plan_generated",
+            plan_json=_json.dumps(plan.to_dict(), ensure_ascii=False),
+        )
+        task_store.save_criteria(db, task_id, plan.success_criteria)
+        logger.info("[Brain] Plan: %d criteria, %d subtasks",
+                     len(plan.success_criteria), len(plan.subtasks))
+
+        # 3. Inject plan context into system prompt
+        plan_injection = (
+            f"\n\n[TASK PLAN — id: {task_id}]\n"
+            f"Goal: {plan.goal}\n"
+            f"Success criteria (you MUST address ALL of these):\n"
+            + "\n".join(f"  {i+1}. {c}" for i, c in enumerate(plan.success_criteria))
+            + "\n\nCollect evidence for each criterion through your tool usage. "
+            "Do not claim completion without actually performing the work."
+        )
+        enriched_prompt = context_prompt + plan_injection
+
+        # 4. Execute via existing agent path
+        task_store.update_task_status(db, task_id, "running", reason="execution_started")
+
+        agent_result = await self._run_agent(
+            message=message_text,
+            context_prompt=enriched_prompt,
+            history=history,
+            source=source,
+            session_id=session_id,
+            session_key=session_key,
+            event_message_id=getattr(event, 'message_id', None),
+        )
+
+        # 5. Capture evidence from tool calls in the result
+        for msg in agent_result.get("messages", []):
+            if msg.get("role") in ("tool", "function") and msg.get("content"):
+                try:
+                    brain_evidence.capture_from_tool_result(
+                        task_id,
+                        tool_name=msg.get("tool_name") or msg.get("name", "unknown"),
+                        tool_call_id=msg.get("tool_call_id", ""),
+                        output=msg.get("content", ""),
+                        db=db,
+                    )
+                except Exception as _ev_exc:
+                    logger.debug("Evidence capture failed (non-fatal): %s", _ev_exc)
+
+        final_response = agent_result.get("final_response", "")
+        if final_response:
+            try:
+                brain_evidence.capture_from_response(task_id, final_response, db)
+            except Exception:
+                pass
+
+        # 6. Verify
+        task_store.update_task_status(db, task_id, "verifying", reason="verification_started")
+
+        criteria = task_store.get_criteria(db, task_id)
+        ev_records = brain_evidence.get_evidence_for_task(task_id, db)
+
+        vr = verify_task(
+            goal=plan.goal,
+            criteria=criteria,
+            evidence=ev_records,
+            final_response=final_response,
+        )
+
+        # 7. Finalize task
+        if vr.status == "pass":
+            task_store.update_task_status(
+                db, task_id, "completed",
+                reason="verification_pass",
+                verification_status=vr.status,
+                verification_json=_json.dumps(vr.to_dict(), ensure_ascii=False),
+            )
+            logger.info("[Brain] Task %s completed — verified pass", task_id)
+        else:
+            # Check retry budget
+            retry_count, max_retries = task_store.increment_retry(db, task_id)
+            if vr.status == "fail_retriable" and retry_count <= max_retries:
+                logger.info("[Brain] Task %s verification failed, retrying (%d/%d)",
+                             task_id, retry_count, max_retries)
+                # Retry: re-run with feedback about what's missing
+                task_store.update_task_status(db, task_id, "running", reason=f"retry_{retry_count}")
+
+                retry_note = (
+                    f"\n\n[VERIFICATION FAILED — retry {retry_count}/{max_retries}]\n"
+                    f"Missing criteria: {', '.join(vr.missing_evidence)}\n"
+                    f"Please address the missing criteria and provide evidence."
+                )
+                retry_result = await self._run_agent(
+                    message=message_text + retry_note,
+                    context_prompt=enriched_prompt,
+                    history=agent_result.get("messages", history),
+                    source=source,
+                    session_id=session_id,
+                    session_key=session_key,
+                    event_message_id=getattr(event, 'message_id', None),
+                )
+
+                # Capture retry evidence
+                for msg in retry_result.get("messages", []):
+                    if msg.get("role") in ("tool", "function") and msg.get("content"):
+                        try:
+                            brain_evidence.capture_from_tool_result(
+                                task_id,
+                                tool_name=msg.get("tool_name") or msg.get("name", "unknown"),
+                                tool_call_id=msg.get("tool_call_id", ""),
+                                output=msg.get("content", ""),
+                                db=db,
+                            )
+                        except Exception:
+                            pass
+
+                retry_response = retry_result.get("final_response", "")
+                if retry_response:
+                    try:
+                        brain_evidence.capture_from_response(task_id, retry_response, db)
+                    except Exception:
+                        pass
+
+                task_store.update_task_status(
+                    db, task_id, "verifying", reason="retry_verification",
+                )
+                # Re-verify
+                ev_records_2 = brain_evidence.get_evidence_for_task(task_id, db)
+                vr2 = verify_task(
+                    goal=plan.goal,
+                    criteria=criteria,
+                    evidence=ev_records_2,
+                    final_response=retry_response or final_response,
+                )
+                final_status = "completed" if vr2.status == "pass" else "failed"
+                task_store.update_task_status(
+                    db, task_id, final_status,
+                    reason=f"retry_verification_{vr2.status}",
+                    verification_status=vr2.status,
+                    verification_json=_json.dumps(vr2.to_dict(), ensure_ascii=False),
+                )
+                logger.info("[Brain] Task %s after retry: %s", task_id, final_status)
+                # Use retry result if it has a response
+                if retry_response:
+                    agent_result = retry_result
+            else:
+                # No more retries or non-retriable failure
+                task_store.update_task_status(
+                    db, task_id, "failed",
+                    reason=f"verification_{vr.status}",
+                    failure_reason=vr.summary,
+                    verification_status=vr.status,
+                    verification_json=_json.dumps(vr.to_dict(), ensure_ascii=False),
+                )
+                logger.info("[Brain] Task %s failed: %s", task_id, vr.summary)
+                # Don't block the response — user still gets the agent's output
+
+        # ═══ v2 Learning Flow (post-task) ═════════════════════════
+        # Non-blocking: if any learning step fails, we still return the result.
+        try:
+            self._run_learning_pipeline(db, task_id, plan)
+        except Exception as _learn_exc:
+            logger.debug("[Brain] Learning pipeline failed (non-fatal): %s", _learn_exc)
+        # ═════════════════════════════════════════════════════════
+
+        return agent_result
+
+    def _brain_planner_llm_call(self):
+        """Return a callable for the planner to use for LLM inference.
+
+        Uses the auxiliary client (cheap/fast model) when available,
+        falls back to None (which triggers the fallback plan).
+        """
+        def _call(system_prompt: str, user_prompt: str) -> str:
+            try:
+                from agent.auxiliary_client import get_auxiliary_client
+                client = get_auxiliary_client()
+                if client is None:
+                    raise RuntimeError("No auxiliary client available")
+                # Use auxiliary model (typically a cheap/fast model)
+                resp = client.chat.completions.create(
+                    model=getattr(client, '_model', None) or "gpt-4o-mini",
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    temperature=0.2,
+                    max_tokens=2000,
+                )
+                return resp.choices[0].message.content or ""
+            except Exception as e:
+                logger.debug("[Brain] Planner LLM call failed: %s", e)
+                raise
+
+        try:
+            from agent.auxiliary_client import get_auxiliary_client
+            if get_auxiliary_client() is not None:
+                return _call
+        except Exception:
+            pass
+        return None
+
+    def _run_learning_pipeline(self, db, task_id: str, plan) -> None:
+        """
+        Post-task learning: reflection → memory curation → skill generation.
+
+        Runs synchronously but is wrapped in try/except by the caller,
+        so failures here never block the response.
+        """
+        import json as _json
+        from brain import task_store, evidence as brain_evidence
+        from brain.reflection import generate_reflection
+        from brain.memory_curator import curate_after_task
+        from brain.skill_engine import generate_candidate, auto_promote
+
+        task = task_store.get_task(db, task_id)
+        if not task:
+            return
+
+        ev_records = brain_evidence.get_evidence_for_task(task_id, db)
+        plan_data = None
+        if task.get("plan_json"):
+            try:
+                plan_data = _json.loads(task["plan_json"])
+            except (TypeError, _json.JSONDecodeError):
+                pass
+
+        verification_data = None
+        if task.get("verification_json"):
+            try:
+                verification_data = _json.loads(task["verification_json"])
+            except (TypeError, _json.JSONDecodeError):
+                pass
+
+        # 1. Reflection
+        reflection = generate_reflection(
+            db, task, ev_records,
+            verification=verification_data,
+            plan=plan_data,
+        )
+        logger.debug("[Brain] Reflection: root_cause=%s confidence=%.2f",
+                     reflection.get("root_cause_class"), reflection.get("confidence", 0))
+
+        # 2. Memory curation
+        curation = curate_after_task(
+            db, task_id, task, ev_records,
+            verification_status=task.get("verification_status", "unknown"),
+            plan=plan_data,
+        )
+        logger.debug("[Brain] Curation: episodic=%s semantic=%s skill_candidate=%s",
+                     bool(curation["episodic_written"]),
+                     bool(curation["semantic_written"]),
+                     curation["skill_candidate"])
+
+        # 3. Skill generation (only for verified-pass tasks)
+        if curation["skill_candidate"] and task.get("verification_status") == "pass" and plan_data:
+            skill_id = generate_candidate(db, task, plan_data, ev_records)
+            if skill_id:
+                auto_promote(db, skill_id)
+                logger.info("[Brain] Skill candidate %s generated and auto-promoted", skill_id)
+
+    # ═══════════════════════════════════════════════════════════════
+
     async def _run_agent(
         self,
         message: str,
@@ -5376,6 +6365,22 @@ class GatewayRunner:
             
             # Return final response, or a message if something went wrong
             final_response = result.get("final_response")
+            agent_failed = bool(result.get("failed"))
+            if agent_failed:
+                try:
+                    from gateway.status import write_runtime_status
+
+                    write_runtime_status(
+                        last_agent_failure={
+                            "error_code": result.get("error_code", "unknown"),
+                            "error": str(result.get("error", ""))[:500],
+                            "session_id": session_id,
+                            "platform": source.platform.value,
+                            "failed_at": _utc_now_iso(),
+                        }
+                    )
+                except Exception:
+                    pass
 
             # Extract actual token counts from the agent instance used for this run
             _last_prompt_toks = 0
@@ -5400,6 +6405,7 @@ class GatewayRunner:
                     "input_tokens": _input_toks,
                     "output_tokens": _output_toks,
                     "model": _resolved_model,
+                    "error_code": result.get("error_code"),
                 }
             
             # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -5468,6 +6474,24 @@ class GatewayRunner:
                     )
                 except Exception:
                     pass
+
+            # Memory V2: working memory writeback (non-blocking, best-effort)
+            if final_response and effective_session_id:
+                try:
+                    from agent.memory_v2_runtime import (
+                        is_memory_v2_available,
+                        summarize_memory_turn,
+                        update_working_memory,
+                    )
+                    if is_memory_v2_available():
+                        _turn = summarize_memory_turn(
+                            user_message=message,
+                            assistant_response=final_response,
+                            session_id=effective_session_id,
+                        )
+                        update_working_memory(effective_session_id, _turn)
+                except Exception as _v2wb_err:
+                    logger.debug("Memory V2 writeback failed: %s", _v2wb_err)
 
             return {
                 "final_response": final_response,
@@ -5743,7 +6767,14 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # setups (each profile using a distinct HERMES_HOME) will naturally
     # allow concurrent instances without tripping this guard.
     import time as _time
-    from gateway.status import get_running_pid, remove_pid_file
+    from gateway.status import get_running_pid, remove_pid_file, repair_runtime_state_for_startup
+    startup_repair = repair_runtime_state_for_startup()
+    if startup_repair.get("cleared_runtime_status") or startup_repair.get("released_scoped_locks"):
+        logger.warning(
+            "Gateway startup repaired stale runtime state: cleared_runtime_status=%s released_scoped_locks=%s",
+            startup_repair.get("cleared_runtime_status", False),
+            startup_repair.get("released_scoped_locks", 0),
+        )
     existing_pid = get_running_pid()
     if existing_pid is not None and existing_pid != os.getpid():
         if replace:
