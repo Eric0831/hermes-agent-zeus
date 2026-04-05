@@ -284,6 +284,43 @@ def session_search(
             offset=0,
         )
 
+        # Embedding re-rank: boost FTS5 results with semantic similarity
+        if raw_results and len(raw_results) > 3:
+            try:
+                import requests as _req
+                _embed_url = "http://localhost:8103/v1/embeddings"
+                _model = "Qwen/Qwen3-VL-Embedding-2B"
+
+                # Embed query
+                _qr = _req.post(_embed_url,
+                    json={"model": _model, "input": query[:512]}, timeout=5)
+                if _qr.status_code == 200:
+                    import numpy as _np
+                    q_vec = _np.array(_qr.json()["data"][0]["embedding"][:256])
+
+                    # Embed each result's content snippet and re-score
+                    scored = []
+                    for res in raw_results:
+                        snippet = (res.get("content") or "")[:256]
+                        try:
+                            _rr = _req.post(_embed_url,
+                                json={"model": _model, "input": snippet}, timeout=3)
+                            if _rr.status_code == 200:
+                                r_vec = _np.array(_rr.json()["data"][0]["embedding"][:256])
+                                cos_sim = float(_np.dot(q_vec, r_vec) /
+                                               (_np.linalg.norm(q_vec) * _np.linalg.norm(r_vec) + 1e-10))
+                                scored.append((cos_sim, res))
+                            else:
+                                scored.append((0.0, res))
+                        except Exception:
+                            scored.append((0.0, res))
+
+                    # Sort by embedding similarity (descending)
+                    scored.sort(key=lambda x: x[0], reverse=True)
+                    raw_results = [r for _, r in scored]
+            except Exception:
+                pass  # fallback to FTS5 order
+
         if not raw_results:
             return json.dumps({
                 "success": True,
