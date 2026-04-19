@@ -24,6 +24,22 @@ logger = logging.getLogger(__name__)
 AUTHORITY_LEVELS = ("operational", "strategic", "governance", "constitutional")
 
 
+# -- Federation seed ---------------------------------------------------------
+#
+# ZEUS federal v38.2 topology: 5 market apostles + KIWI regime broadcast.
+# Seeded into agent_clusters so Hermes (governance layer) can track
+# jurisdictions, trust, and eventually route cross-layer tasks. Update
+# here when the federation membership changes.
+SEED_APOSTLES: list[tuple[str, dict, str]] = [
+    ("OCEAN",  {"market": "TWSE",     "broker": "Sinopac", "region": "TW",     "asset": "equities"}, "operational"),
+    ("ELEVEN", {"market": "TAIFEX",   "broker": "KGI",     "region": "TW",     "asset": "futures"},  "operational"),
+    ("WILSON", {"market": "US",       "broker": "Futu",    "region": "US",     "asset": "equities"}, "operational"),
+    ("SUSAN",  {"market": "overseas", "broker": "futures", "region": "global", "asset": "futures"},  "operational"),
+    ("CRYPTO", {"market": "crypto",   "broker": "Binance", "region": "global", "asset": "crypto"},   "operational"),
+    ("KIWI",   {"role": "regime_broadcast", "region": "global"},                                      "strategic"),
+]
+
+
 def _cid() -> str:
     return f"clust_{uuid.uuid4().hex[:12]}"
 
@@ -98,6 +114,46 @@ def get_all_clusters(db: Any, status: str = "active") -> list[dict]:
     except Exception as e:
         logger.error("[Society] get_all_clusters failed: %s", e)
         return []
+
+
+def register_if_absent(
+    db: Any,
+    name: str,
+    jurisdiction: dict | list | str,
+    *,
+    authority_level: str = "operational",
+) -> tuple[str, bool]:
+    """Register a cluster iff no active cluster with this name exists.
+
+    Returns (cluster_id, newly_created). Idempotent so it can be called
+    safely from gateway startup or a seeding script.
+    """
+    for c in get_all_clusters(db, status="active"):
+        if c.get("cluster_name") == name:
+            return c["id"], False
+    cid = register_cluster(db, name=name, jurisdiction=jurisdiction, authority_level=authority_level)
+    return cid, True
+
+
+def seed_federation(db: Any, apostles: list[tuple[str, dict, str]] | None = None) -> dict[str, str]:
+    """Ensure the canonical ZEUS federation clusters exist.
+
+    Uses SEED_APOSTLES by default. Returns {name: cluster_id} and logs
+    new vs existing entries. Safe to call on every gateway startup.
+    """
+    seed = apostles if apostles is not None else SEED_APOSTLES
+    result: dict[str, str] = {}
+    created = 0
+    for name, jurisdiction, authority in seed:
+        cid, new = register_if_absent(db, name=name, jurisdiction=jurisdiction, authority_level=authority)
+        result[name] = cid
+        if new:
+            created += 1
+    if created:
+        logger.info("[Society] seed_federation: %d/%d new clusters registered", created, len(seed))
+    else:
+        logger.debug("[Society] seed_federation: all %d clusters already present", len(seed))
+    return result
 
 
 def deactivate_cluster(db: Any, cluster_id: str) -> None:
