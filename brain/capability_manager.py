@@ -313,6 +313,200 @@ def deprecate_version(db: Any, version_id: str) -> None:
     logger.info("[CapabilityManager] Deprecated %s", version_id)
 
 
+def execute_action(db: Any, version_id: str) -> dict:
+    """Execute a capability_version's embedded action_hint.
+
+    Today only the 'extract_skill' kind is implemented end-to-end.
+    Other kinds return a structured 'not_implemented' response so the
+    operator knows the bookkeeping succeeded but the work is theirs.
+
+    Returns a dict with:
+        {"executed": bool, "kind": str, "result": ..., "note": str}
+
+    Raises ValueError if the version doesn't exist or is in a
+    state where executing its action_hint makes no sense
+    (deprecated / retired).
+    """
+    v = get_version(db, version_id)
+    if not v:
+        raise ValueError(f"Capability version not found: {version_id}")
+    if v["status"] in ("deprecated", "retired"):
+        raise ValueError(
+            f"Version {version_id} is {v['status']} — refusing to execute action"
+        )
+
+    try:
+        definition = json.loads(v.get("definition_json") or "{}")
+    except Exception:
+        definition = {}
+    source = definition.get("source") or {}
+    action_hint = source.get("action_hint") or {}
+    kind = action_hint.get("kind") or ""
+
+    if not kind:
+        return {
+            "executed": False,
+            "kind": "",
+            "result": None,
+            "note": "version has no action_hint — operator-guided only",
+        }
+
+    if kind == "extract_skill":
+        result = _execute_extract_skill(db, v, action_hint)
+        return {"executed": True, "kind": kind, "result": result, "note": ""}
+
+    return {
+        "executed": False,
+        "kind": kind,
+        "result": None,
+        "note": (
+            f"action_hint kind '{kind}' is recognized but not yet auto-executable. "
+            "Operator should apply the suggestion manually; a future commit will "
+            "wire the executor."
+        ),
+    }
+
+
+def _execute_extract_skill(
+    db: Any, version: dict, action_hint: dict,
+) -> dict:
+    """Synthesize a skill_registry candidate from the top successful
+    tasks of the target family.
+
+    Strategy:
+      1. Pick up to 10 most recent completed tasks in the family.
+      2. Gather each task's tool sequence from evidence_records
+         (ordered by created_at).
+      3. Compute the frequency-weighted union of tools used.
+      4. Create a single skill_registry row, status='candidate',
+         with source_task_id pointing at the most recent representative
+         task and the source proposal/version referenced in the
+         definition.
+
+    Returns {"skill_id", "skill_name", "tasks_sampled", "tools": [...]}
+    """
+    family = action_hint.get("task_family") or version.get("capability_family", "").split(":", 1)[-1]
+    skill_name = action_hint.get("skill_name") or f"{family}_auto_extracted"
+
+    tasks = db._conn.execute(
+        """SELECT id, task_type, goal, risk_level, completed_at
+           FROM tasks
+           WHERE status = 'completed' AND task_type = ?
+           ORDER BY completed_at DESC LIMIT 10""",
+        (family,),
+    ).fetchall()
+    if not tasks:
+        return {
+            "skill_id": None,
+            "skill_name": skill_name,
+            "tasks_sampled": 0,
+            "tools": [],
+            "note": f"no completed tasks for family '{family}' — nothing to extract",
+        }
+
+    tool_freq: dict[str, int] = {}
+    ordered_tools_by_task: list[list[str]] = []
+    for t in tasks:
+        tid = t["id"] if hasattr(t, "keys") else t[0]
+        seq = db._conn.execute(
+            """SELECT tool_name FROM evidence_records
+               WHERE task_id = ? AND tool_name IS NOT NULL
+                     AND tool_name NOT IN ('', 'unknown')
+               ORDER BY created_at""",
+            (tid,),
+        ).fetchall()
+        tools_this_task = [
+            (r["tool_name"] if hasattr(r, "keys") else r[0]) for r in seq
+        ]
+        if tools_this_task:
+            ordered_tools_by_task.append(tools_this_task)
+            for tn in tools_this_task:
+                tool_freq[tn] = tool_freq.get(tn, 0) + 1
+
+    if not tool_freq:
+        return {
+            "skill_id": None,
+            "skill_name": skill_name,
+            "tasks_sampled": len(tasks),
+            "tools": [],
+            "note": (
+                f"sampled {len(tasks)} tasks but no named tool evidence — "
+                "waiting for the c8cb2504 tool_name fix to accumulate data"
+            ),
+        }
+
+    # Dominant tools: sort by frequency, take top ordered by first appearance
+    ranked = sorted(tool_freq.items(), key=lambda kv: (-kv[1], kv[0]))
+    core_tools = [name for name, _ in ranked[:6]]
+
+    # Canonical step sequence: intersect the per-task sequences
+    # preserving first-seen order from the most recent task
+    canonical_seq: list[str] = []
+    for tn in (ordered_tools_by_task[0] if ordered_tools_by_task else []):
+        if tn in core_tools and tn not in canonical_seq:
+            canonical_seq.append(tn)
+    for tn in core_tools:
+        if tn not in canonical_seq:
+            canonical_seq.append(tn)
+
+    representative = tasks[0]
+    rep_id = representative["id"] if hasattr(representative, "keys") else representative[0]
+    rep_goal = representative["goal"] if hasattr(representative, "keys") else representative[2]
+
+    definition = {
+        "intent": f"{family}_auto",
+        "task_type": family,
+        "preconditions": [],
+        "steps": [{"description": f"call {tn}", "tool": tn} for tn in canonical_seq],
+        "tools": core_tools,
+        "tool_frequencies": dict(ranked),
+        "source": {
+            "kind": "capability_version",
+            "version_id": version["id"],
+            "source_proposal_id": version.get("source_proposal_id"),
+            "tasks_sampled": len(tasks),
+            "representative_task_id": rep_id,
+            "representative_goal": (rep_goal or "")[:200],
+        },
+        "success_criteria": [f"completed a '{family}' task"],
+        "verification_checklist": [f"tools {', '.join(core_tools[:3])} actually invoked"],
+        "fallback_hints": [],
+    }
+
+    import uuid as _uuid
+    sid = f"skill_{_uuid.uuid4().hex[:12]}"
+    now = time.time()
+
+    def _do(conn):
+        conn.execute(
+            """INSERT INTO skill_registry
+               (id, skill_name, intent_family, version, status, definition_json,
+                success_rate, usage_count, created_at, updated_at, risk_level,
+                source_task_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                sid, skill_name, f"{family}_auto", "1.0", "candidate",
+                json.dumps(definition, ensure_ascii=False),
+                1.0, 0, now, now, "low", rep_id,
+            ),
+        )
+
+    db._execute_write(_do)
+    logger.info(
+        "[CapabilityManager] extract_skill: created %s (%s) from version %s "
+        "sampling %d tasks",
+        sid, skill_name, version["id"], len(tasks),
+    )
+    return {
+        "skill_id": sid,
+        "skill_name": skill_name,
+        "tasks_sampled": len(tasks),
+        "tools": core_tools,
+        "canonical_seq": canonical_seq,
+        "representative_task_id": rep_id,
+    }
+
+
 def list_versions(
     db: Any,
     *,

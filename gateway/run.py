@@ -3474,6 +3474,37 @@ class GatewayRunner:
                 except Exception as e:
                     return f"Deprecate failed: {e}"
 
+            # /tasks execute <version_id> — run the capability_version's
+            # embedded action_hint (today: extract_skill only; others
+            # report "not yet auto-executable")
+            if args.startswith("execute "):
+                try:
+                    from brain.capability_manager import execute_action
+                    vid = args[len("execute"):].strip()
+                    if not vid:
+                        return "Usage: `/tasks execute <version_id>`"
+                    result = execute_action(db, vid)
+                    if not result.get("executed"):
+                        return (
+                            f"Version `{vid}`: action_hint kind "
+                            f"`{result.get('kind', '-')}` not executed.\n"
+                            f"{result.get('note', '')}"
+                        )
+                    payload = result.get("result") or {}
+                    lines = [
+                        f"Executed `{result.get('kind')}` on version `{vid}`:",
+                    ]
+                    for k, v in payload.items():
+                        vs = str(v)
+                        if len(vs) > 100:
+                            vs = vs[:97] + "..."
+                        lines.append(f"  {k}: {vs}")
+                    return "\n".join(lines)
+                except ValueError as ve:
+                    return f"Execute refused: {ve}"
+                except Exception as e:
+                    return f"Execute failed: {e}"
+
             # /tasks experiment <version_id> — advance incubating → experimental
             if args.startswith("experiment "):
                 try:
