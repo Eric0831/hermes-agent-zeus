@@ -355,6 +355,10 @@ def execute_action(db: Any, version_id: str) -> dict:
         result = _execute_extract_skill(db, v, action_hint)
         return {"executed": True, "kind": kind, "result": result, "note": ""}
 
+    if kind == "extract_precedents":
+        result = _execute_extract_precedents(db, v, action_hint)
+        return {"executed": True, "kind": kind, "result": result, "note": ""}
+
     return {
         "executed": False,
         "kind": kind,
@@ -504,6 +508,96 @@ def _execute_extract_skill(
         "tools": core_tools,
         "canonical_seq": canonical_seq,
         "representative_task_id": rep_id,
+    }
+
+
+def _execute_extract_precedents(
+    db: Any, version: dict, action_hint: dict,
+) -> dict:
+    """Mine the top N recent completed tasks of the target family for
+    decision-shaped patterns and seed precedent_records.
+
+    Unlike extract_skill (which produces a reusable tool chain), a
+    precedent captures HOW a task was decided — the goal phrasing,
+    the criteria satisfied, whether the verifier passed, and how many
+    evidence artifacts backed it. Future Planner calls for the same
+    family can query find_applicable_precedents to short-circuit to
+    known-good patterns.
+
+    Strategy:
+      1. Pick up to 10 most recent completed + verified tasks in the family
+      2. For each, record a precedent keyed on task_family with decision
+         payload summarizing the task, plan, criteria-met count, and
+         evidence volume
+      3. binding_strength derived from evidence_count (capped at 0.9)
+    """
+    from brain import precedent_store
+
+    family = action_hint.get("task_family") or version.get("capability_family", "").split(":", 1)[-1]
+    limit = int(action_hint.get("limit", 10))
+
+    tasks = db._conn.execute(
+        """SELECT id, task_type, goal, risk_level, verification_status,
+                  completed_at, plan_json
+           FROM tasks
+           WHERE status = 'completed' AND task_type = ?
+                 AND verification_status = 'pass'
+           ORDER BY completed_at DESC LIMIT ?""",
+        (family, limit),
+    ).fetchall()
+    if not tasks:
+        return {
+            "precedents_created": 0,
+            "family": family,
+            "tasks_sampled": 0,
+            "note": f"no completed+verified tasks for family '{family}' — nothing to extract",
+        }
+
+    created: list[str] = []
+    for t in tasks:
+        td = dict(t) if hasattr(t, "keys") else {}
+        tid = td.get("id")
+        goal = (td.get("goal") or "")[:250]
+        evidence_count = db._conn.execute(
+            "SELECT COUNT(*) FROM evidence_records WHERE task_id = ?",
+            (tid,),
+        ).fetchone()[0]
+        criteria_met = db._conn.execute(
+            "SELECT COUNT(*) FROM task_criteria WHERE task_id = ? AND status = 'met'",
+            (tid,),
+        ).fetchone()[0]
+        criteria_total = db._conn.execute(
+            "SELECT COUNT(*) FROM task_criteria WHERE task_id = ?",
+            (tid,),
+        ).fetchone()[0]
+
+        decision = {
+            "family": family,
+            "goal": goal,
+            "verification": td.get("verification_status"),
+            "criteria_met": criteria_met,
+            "criteria_total": criteria_total,
+            "evidence_count": evidence_count,
+            "source_version_id": version["id"],
+            "source_proposal_id": version.get("source_proposal_id"),
+        }
+        # Stronger precedent when we have more evidence backing the decision
+        binding_strength = min(0.5 + evidence_count * 0.01, 0.9)
+        pid = precedent_store.create_precedent(
+            db,
+            precedent_type=f"family_pattern:{family}",
+            subject_type="task_family",
+            subject_id=family,
+            decision=decision,
+            binding_strength=binding_strength,
+        )
+        created.append(pid)
+
+    return {
+        "precedents_created": len(created),
+        "family": family,
+        "tasks_sampled": len(tasks),
+        "precedent_ids": created[:3] + (["..."] if len(created) > 3 else []),
     }
 
 
