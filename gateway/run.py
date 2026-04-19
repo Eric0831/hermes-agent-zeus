@@ -502,6 +502,17 @@ class GatewayRunner:
             self._session_db = SessionDB()
         except Exception as e:
             logger.debug("SQLite session store not available: %s", e)
+
+        # Ensure ZEUS federation clusters exist in agent_clusters. Idempotent
+        # — only registers what's missing. Lets governance / world_state /
+        # jurisdiction checks work from the first message after a clean
+        # state.db.
+        if self._session_db is not None:
+            try:
+                from brain.agent_society import seed_federation
+                seed_federation(self._session_db)
+            except Exception as e:
+                logger.debug("Federation seed skipped: %s", e)
         
         # DM pairing store for code-based user authorization
         from gateway.pairing import PairingStore
