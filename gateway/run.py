@@ -3409,6 +3409,71 @@ class GatewayRunner:
                 except Exception as e:
                     return f"Versions listing failed: {e}"
 
+            # /tasks rollout <version_id> — experimental → limited_rollout
+            if args.startswith("rollout "):
+                try:
+                    from brain.capability_manager import get_version, transition_status
+                    vid = args[len("rollout"):].strip()
+                    if not vid:
+                        return "Usage: `/tasks rollout <version_id>`"
+                    v = get_version(db, vid)
+                    if not v:
+                        return f"No version with id `{vid}`."
+                    if v["status"] != "experimental":
+                        return f"Version `{vid}` is `{v['status']}` — only `experimental` can move to `limited_rollout`."
+                    transition_status(db, vid, "limited_rollout", reason="operator_started_rollout")
+                    return (
+                        f"Version `{vid}` moved to `limited_rollout`.\n"
+                        "Next step: `/tasks adopt <version_id>` once validation is complete."
+                    )
+                except ValueError as ve:
+                    return f"Rollout refused: {ve}"
+                except Exception as e:
+                    return f"Rollout failed: {e}"
+
+            # /tasks adopt <version_id> — limited_rollout → adopted (atomic
+            # swap with any previously adopted version for the same family)
+            if args.startswith("adopt "):
+                try:
+                    from brain.capability_manager import get_version, adopt_version
+                    vid = args[len("adopt"):].strip()
+                    if not vid:
+                        return "Usage: `/tasks adopt <version_id>`"
+                    v = get_version(db, vid)
+                    if not v:
+                        return f"No version with id `{vid}`."
+                    ok = adopt_version(db, vid)
+                    if not ok:
+                        return f"Adoption refused — version `{vid}` is `{v['status']}` (must be `limited_rollout`)."
+                    return (
+                        f"Version `{vid}` ADOPTED for family `{v['capability_family']}`.\n"
+                        "Any prior adopted version for this family has been deprecated."
+                    )
+                except Exception as e:
+                    return f"Adopt failed: {e}"
+
+            # /tasks deprecate <version_id> [reason] — retire a version at
+            # any stage (last-resort backstop; governance normally
+            # routes through reject / adopt-swap)
+            if args.startswith("deprecate "):
+                try:
+                    from brain.capability_manager import get_version, deprecate_version
+                    rest = args[len("deprecate"):].strip()
+                    parts = rest.split(None, 1)
+                    vid = parts[0] if parts else ""
+                    reason = parts[1] if len(parts) > 1 else "operator_deprecated_via_cli"
+                    if not vid:
+                        return "Usage: `/tasks deprecate <version_id> [reason]`"
+                    v = get_version(db, vid)
+                    if not v:
+                        return f"No version with id `{vid}`."
+                    if v["status"] in ("deprecated", "retired"):
+                        return f"Version `{vid}` is already `{v['status']}`."
+                    deprecate_version(db, vid)
+                    return f"Version `{vid}` deprecated ({reason})."
+                except Exception as e:
+                    return f"Deprecate failed: {e}"
+
             # /tasks experiment <version_id> — advance incubating → experimental
             if args.startswith("experiment "):
                 try:
