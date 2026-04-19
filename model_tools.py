@@ -142,6 +142,8 @@ def _discover_tools():
         "tools.vision_tools",
         "tools.mixture_of_agents_tool",
         "tools.image_generation_tool",
+        "tools.local_image_tool",  # Local image generation - FREE, no API required
+        "tools.image_processing_tool",  # Advanced image processing - FREE
         "tools.skills_tool",
         "tools.skill_manager_tool",
         "tools.browser_tool",

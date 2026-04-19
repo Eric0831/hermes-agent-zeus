@@ -35,8 +35,10 @@ _HERMES_CORE_TOOLS = [
     "terminal", "process",
     # File manipulation
     "read_file", "write_file", "patch", "search_files",
-    # Vision + image generation
-    "vision_analyze", "image_generate",
+    # Vision + image generation + image processing
+    "vision_analyze", "image_generate", "local_image_generate",
+    "remove_background", "apply_instagram_filter", "image_to_sketch",
+    "apply_opencv_filter", "enhance_image", "apply_kimono_style",
     # MoA
     "mixture_of_agents",
     # Skills
