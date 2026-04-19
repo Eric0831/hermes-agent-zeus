@@ -22,28 +22,86 @@ logger = logging.getLogger(__name__)
 
 # ── Tool Risk Profiles ────────────────────────────────────────────
 
-# Default risk levels for known tools (overridable via config)
+# Default risk levels for known tools (overridable via config).
+# Keep this list aligned with the runtime tool registry — unmapped tools
+# fall through to "low" which is almost always wrong for anything with
+# external or destructive side effects.
 _TOOL_RISK_PROFILES: dict[str, str] = {
-    # High risk — external side effects
-    "send_message": "high",
+    # ── HIGH — destructive / privileged / cross-agent control ─────────
+    "send_message": "high",            # outbound to user / external platform
+    "deploy": "high",
+    "agent_admin": "high",             # Hermes admin — r/w any agent config
+    "mcp_git_git_push": "high",        # publishes to remote
+    "mcp_git_git_reset": "high",       # can destroy working tree
+    # ── MEDIUM — write / execute / external effect ────────────────────
     "terminal": "medium",
     "shell_exec_sandboxed": "medium",
-    "deploy": "high",
-    # Medium risk — write operations
+    "process": "medium",               # background process registry
     "write_file": "medium",
     "patch": "medium",
-    "image_generate": "low",
     "cronjob": "medium",
-    # Low risk — read-only
+    "execute_code": "medium",          # sandboxed, still runs arbitrary code
+    "delegate_task": "medium",         # spawns a sub-agent with its own budget
+    "ha_call_service": "medium",       # Home Assistant state change
+    "mcp_filesystem_write_file": "medium",
+    "mcp_filesystem_edit_file": "medium",
+    "mcp_filesystem_move_file": "medium",
+    "mcp_filesystem_create_directory": "medium",
+    "mcp_git_git_add": "medium",
+    "mcp_git_git_commit": "medium",
+    "mcp_git_git_checkout": "medium",
+    "mcp_git_git_create_branch": "medium",
+    "honcho_conclude": "medium",       # writes user-profile memory
+    "honcho_profile": "medium",
+    "browser_click": "medium",         # can submit forms / trigger side effects
+    "browser_type": "medium",
+    "browser_press": "medium",
+    # ── LOW — read-only / cosmetic ────────────────────────────────────
     "web_search": "low",
     "web_extract": "low",
     "read_file": "low",
     "search_files": "low",
     "browser_navigate": "low",
+    "browser_back": "low",
+    "browser_close": "low",
+    "browser_scroll": "low",
+    "browser_snapshot": "low",
+    "browser_console": "low",
+    "browser_vision": "low",
+    "browser_get_images": "low",
     "vision_analyze": "low",
     "session_search": "low",
     "memory": "low",
     "todo": "low",
+    "clarify": "low",
+    "image_generate": "low",
+    "local_image_generate": "low",
+    "image_to_sketch": "low",
+    "apply_instagram_filter": "low",
+    "apply_opencv_filter": "low",
+    "apply_kimono_style": "low",
+    "enhance_image": "low",
+    "ha_get_state": "low",
+    "ha_list_entities": "low",
+    "ha_list_services": "low",
+    "honcho_context": "low",
+    "honcho_search": "low",
+    "mcp_ddg_search_duckduckgo_web_search": "low",
+    "mcp_fetch_fetch": "low",
+    "mcp_filesystem_read_file": "low",
+    "mcp_filesystem_read_text_file": "low",
+    "mcp_filesystem_read_media_file": "low",
+    "mcp_filesystem_read_multiple_files": "low",
+    "mcp_filesystem_list_directory": "low",
+    "mcp_filesystem_list_directory_with_sizes": "low",
+    "mcp_filesystem_directory_tree": "low",
+    "mcp_filesystem_search_files": "low",
+    "mcp_filesystem_get_file_info": "low",
+    "mcp_git_git_log": "low",
+    "mcp_git_git_branch": "low",
+    "mcp_git_git_diff": "low",
+    "mcp_git_git_diff_staged": "low",
+    "mcp_git_git_diff_unstaged": "low",
 }
 
 
