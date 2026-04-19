@@ -77,6 +77,9 @@ def generate_proposals(
     # Analyze routing/decomposition issues
     proposals.extend(_analyze_routing_issues(task_family, findings, reflections))
 
+    # Analyze positive signals (fast/evidence_rich/high_performing_tool)
+    proposals.extend(_analyze_positive_signals(task_family, findings, skills))
+
     if not proposals:
         logger.info(
             "[EvolutionArchitect] No proposals generated for family '%s'",
@@ -546,6 +549,126 @@ def _analyze_routing_issues(
                 "expected_gain": 0.25,
                 "risk_score": 0.15,
             })
+
+    return proposals
+
+
+def _analyze_positive_signals(
+    task_family: str,
+    findings: list[dict],
+    skills: list[dict],
+) -> list[dict]:
+    """Turn healthy-system findings into promotion / extraction proposals.
+
+    Phase 0 meta-learning analyzers only fired on negative patterns, so a
+    well-running system produced zero proposals. This matches positive
+    signals (fast_family, evidence_rich_family, high_performing_tool) to
+    concrete 'preserve this pattern' actions.
+    """
+    proposals: list[dict] = []
+
+    fast = [f for f in findings if _finding_type(f) == "fast_family"]
+    if fast and not skills:
+        detail = {}
+        try:
+            detail = json.loads(fast[0].get("finding_json", "{}")).get("detail", {})
+        except Exception:
+            pass
+        median = detail.get("median_duration_s", 0)
+        proposals.append({
+            "proposal_type": "new_skill_family",
+            "title": f"Lock in fast-path template for '{task_family}'",
+            "detail": {
+                "reason": "Family is unusually fast — preserve its plan as a template",
+                "median_duration_s": median,
+                "findings_count": len(fast),
+            },
+            "suggestion": (
+                f"'{task_family}' completes in {median:.0f}s (median), faster "
+                f"than peer families. Capture the subtask sequence of the top "
+                f"10 fastest successful '{task_family}' tasks, extract the "
+                f"common tool chain, and register it as a candidate skill "
+                f"'{task_family}_fast_path'. Promote to active after 3 successful "
+                f"invocations on fresh tasks."
+            ),
+            "action_hint": {
+                "kind": "extract_skill",
+                "task_family": task_family,
+                "source": "top_10_fastest_successful_tasks",
+                "skill_name": f"{task_family}_fast_path",
+            },
+            "expected_gain": 0.30,
+            "risk_score": 0.15,
+        })
+
+    rich = [f for f in findings if _finding_type(f) == "evidence_rich_family"]
+    if rich:
+        detail = {}
+        try:
+            detail = json.loads(rich[0].get("finding_json", "{}")).get("detail", {})
+        except Exception:
+            pass
+        avg = detail.get("avg_evidence_per_task", 0)
+        proposals.append({
+            "proposal_type": "new_skill_family",
+            "title": f"Extract precedents from evidence-rich '{task_family}'",
+            "detail": {
+                "reason": "Family accumulates rich evidence — fertile for precedent extraction",
+                "avg_evidence_per_task": avg,
+                "findings_count": len(rich),
+            },
+            "suggestion": (
+                f"'{task_family}' averages {avg:.0f} evidence/task — significantly "
+                f"above peer families. Run brain.precedent_store on the 10 most "
+                f"recent completed '{task_family}' tasks to extract reusable "
+                f"decision precedents, then expose them to the Planner via its "
+                f"context so future '{task_family}' tasks can shortcut to known-"
+                f"good patterns."
+            ),
+            "action_hint": {
+                "kind": "extract_precedents",
+                "task_family": task_family,
+                "source": "top_10_recent_completed_tasks",
+            },
+            "expected_gain": 0.40,
+            "risk_score": 0.10,
+        })
+
+    high_perf = [f for f in findings if _finding_type(f) == "high_performing_tool"]
+    if high_perf:
+        tools = []
+        for f in high_perf:
+            try:
+                d = json.loads(f.get("finding_json", "{}")).get("detail", {})
+                if d.get("tool"):
+                    tools.append(d["tool"])
+            except Exception:
+                pass
+        tools_str = ", ".join(tools[:5]) if tools else "(see detail)"
+        proposals.append({
+            "proposal_type": "new_routing_doctrine",
+            "title": f"Prefer high-performing tools ({tools_str[:40]}) in '{task_family}'",
+            "detail": {
+                "reason": "These tools show >=90% success correlation — make them the default path",
+                "tools": tools,
+                "findings_count": len(high_perf),
+            },
+            "suggestion": (
+                f"Tools {tools_str} show >=90% success correlation on "
+                f"'{task_family}'. Update the Planner's recommended_tools for "
+                f"this family to put them first in the list so Policy-gated "
+                f"alternatives are only tried when the preferred path is "
+                f"unavailable. This tightens the fast path without removing "
+                f"fallback capability."
+            ),
+            "action_hint": {
+                "kind": "update_recommended_tools",
+                "task_family": task_family,
+                "prefer": tools,
+            },
+            "expected_gain": 0.35,
+            "risk_score": 0.10,
+        })
 
     return proposals
 
