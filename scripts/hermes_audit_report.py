@@ -89,6 +89,18 @@ def collect(gateway: str, path: Path) -> dict:
         "proposals_approved": _q(db, "SELECT COUNT(*) FROM capability_proposals WHERE status='approved'"),
         "proposals_incubating": _q(db, "SELECT COUNT(*) FROM capability_proposals WHERE status='incubating'"),
         "capability_versions_total": _q(db, "SELECT COUNT(*) FROM capability_versions"),
+        # Phase E flow = versions that came from a real proposal (exclude
+        # the brain-evolution bootstrap seed rows which live forever in
+        # status='proposed' with source_proposal_id=NULL and are not
+        # meant to move through the lifecycle).
+        "capability_versions_flow": _q(
+            db,
+            "SELECT COUNT(*) FROM capability_versions WHERE source_proposal_id IS NOT NULL",
+        ),
+        "capability_versions_bootstrap": _q(
+            db,
+            "SELECT COUNT(*) FROM capability_versions WHERE source_proposal_id IS NULL",
+        ),
         "capability_versions_incubating": _q(
             db, "SELECT COUNT(*) FROM capability_versions WHERE status='incubating'"
         ),
@@ -116,7 +128,7 @@ def format_text(snapshot: dict) -> str:
     header = (
         f"{'gateway':10s} {'sess':>5s} {'tasks':>6s} {'OK':>4s} {'FAIL':>5s} "
         f"{'stale':>5s} {'evid':>6s} {'named%':>7s} {'pol':>5s} {'!allow':>7s} "
-        f"{'runs':>5s} {'find':>5s} {'types':>5s} {'prop':>4s} {'capv':>4s}"
+        f"{'runs':>5s} {'find':>5s} {'types':>5s} {'prop':>4s} {'capv_f':>6s} {'capv_b':>6s}"
     )
     lines.append(header)
     lines.append("-" * len(header))
@@ -139,7 +151,8 @@ def format_text(snapshot: dict) -> str:
             f"{g['meta_findings']:>5d} "
             f"{len(g['meta_finding_types']):>5d} "
             f"{g['proposals_total']:>4d} "
-            f"{g['capability_versions_total']:>4d}"
+            f"{g['capability_versions_flow']:>6d} "
+            f"{g['capability_versions_bootstrap']:>6d}"
         )
     lines.append("")
     lines.append("Legend:")
@@ -148,7 +161,8 @@ def format_text(snapshot: dict) -> str:
     lines.append("  !allow       — policy decisions that weren't plain 'allow'")
     lines.append("  types        — distinct meta_learning finding_type values (target: >=3)")
     lines.append("  prop         — total capability_proposals")
-    lines.append("  capv         — total capability_versions (Phase E lifecycle)")
+    lines.append("  capv_f       — capability_versions with source_proposal_id (Phase E flow)")
+    lines.append("  capv_b       — capability_versions from brain-evolution bootstrap (static baseline)")
     return "\n".join(lines)
 
 
