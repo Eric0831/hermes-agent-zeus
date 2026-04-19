@@ -3282,7 +3282,7 @@ class GatewayRunner:
                     return f"Proactive scan failed: {e}"
 
             # /tasks propose [family] — generate capability proposals
-            if args.startswith("propose"):
+            if args.startswith("propose") and not args.startswith("proposals"):
                 try:
                     from brain.evolution_architect import generate_proposals
                     family = args.split(None, 1)[1].strip() if " " in args else None
@@ -3298,6 +3298,105 @@ class GatewayRunner:
                     return "\n".join(lines)
                 except Exception as e:
                     return f"Proposal generation failed: {e}"
+
+            # /tasks proposals [family] [status] — list capability proposals
+            if args.startswith("proposals"):
+                try:
+                    from brain.evolution_architect import get_proposals
+                    parts = args.split()[1:]  # drop "proposals"
+                    family = parts[0] if len(parts) >= 1 else None
+                    status = parts[1] if len(parts) >= 2 else "proposed"
+                    rows = get_proposals(db, task_family=family, status=status, limit=15)
+                    if not rows:
+                        scope = f" for '{family}'" if family else ""
+                        return f"No {status} proposals{scope}."
+                    lines = [f"**Capability Proposals** (status={status}{', family=' + family if family else ''})", ""]
+                    for p in rows:
+                        gain = p.get("expected_gain") or 0.0
+                        risk = p.get("risk_score") or 0.0
+                        lines.append(
+                            f"  `{p['id']}` [{p['proposal_type']}] fam={p['target_task_family']} "
+                            f"gain={gain:.2f} risk={risk:.2f}"
+                        )
+                        lines.append(f"    {(p.get('title') or '')[:90]}")
+                    lines.append("")
+                    lines.append("Use `/tasks proposal <id>`, `/tasks approve <id>`, `/tasks reject <id> [reason]`.")
+                    return "\n".join(lines)
+                except Exception as e:
+                    return f"Proposal listing failed: {e}"
+
+            # /tasks proposal <id> — view a single proposal in detail
+            if args.startswith("proposal ") or args == "proposal":
+                try:
+                    from brain.evolution_architect import get_proposal
+                    import json as _json
+                    pid = args[len("proposal"):].strip()
+                    if not pid:
+                        return "Usage: `/tasks proposal <id>`"
+                    p = get_proposal(db, pid)
+                    if not p:
+                        return f"No proposal found with id `{pid}`."
+                    pj = {}
+                    try:
+                        pj = _json.loads(p.get("proposal_json") or "{}")
+                    except Exception:
+                        pj = {}
+                    lines = [
+                        f"**Proposal** `{p['id']}`",
+                        f"  type: {p['proposal_type']}",
+                        f"  family: {p['target_task_family']}",
+                        f"  status: {p['status']}",
+                        f"  expected_gain: {p.get('expected_gain') or 0.0:.2f}  risk_score: {p.get('risk_score') or 0.0:.2f}",
+                        f"  source_run: {p.get('source_run_id') or '-'}",
+                        "",
+                        f"  title: {p.get('title') or ''}",
+                    ]
+                    if pj.get("suggestion"):
+                        lines.append(f"  suggestion: {pj['suggestion']}")
+                    if pj.get("evidence"):
+                        ev = pj["evidence"]
+                        if isinstance(ev, dict):
+                            lines.append(f"  evidence: {_json.dumps(ev, ensure_ascii=False)[:200]}")
+                    return "\n".join(lines)
+                except Exception as e:
+                    return f"Proposal lookup failed: {e}"
+
+            # /tasks approve <id> — move a proposal to approved
+            if args.startswith("approve "):
+                try:
+                    from brain.evolution_architect import get_proposal, update_proposal_status
+                    pid = args[len("approve"):].strip()
+                    if not pid:
+                        return "Usage: `/tasks approve <proposal_id>`"
+                    p = get_proposal(db, pid)
+                    if not p:
+                        return f"No proposal with id `{pid}`."
+                    if p["status"] != "proposed":
+                        return f"Proposal `{pid}` is in status `{p['status']}` — only `proposed` can be approved."
+                    update_proposal_status(db, pid, "approved", reason="operator_approved_via_cli")
+                    return f"Proposal `{pid}` approved. Next step: promote to incubating via capability_manager."
+                except Exception as e:
+                    return f"Approve failed: {e}"
+
+            # /tasks reject <id> [reason] — move a proposal to rejected
+            if args.startswith("reject "):
+                try:
+                    from brain.evolution_architect import get_proposal, update_proposal_status
+                    rest = args[len("reject"):].strip()
+                    parts = rest.split(None, 1)
+                    pid = parts[0] if parts else ""
+                    reason = parts[1] if len(parts) > 1 else "operator_rejected_via_cli"
+                    if not pid:
+                        return "Usage: `/tasks reject <proposal_id> [reason]`"
+                    p = get_proposal(db, pid)
+                    if not p:
+                        return f"No proposal with id `{pid}`."
+                    if p["status"] not in ("proposed", "approved", "constitutional_checked", "governance_reviewed"):
+                        return f"Proposal `{pid}` is in status `{p['status']}` — cannot reject."
+                    update_proposal_status(db, pid, "rejected", reason=reason)
+                    return f"Proposal `{pid}` rejected ({reason})."
+                except Exception as e:
+                    return f"Reject failed: {e}"
 
             # /tasks capabilities — list capability versions
             if args == "capabilities":
