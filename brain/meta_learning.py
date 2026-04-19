@@ -70,6 +70,9 @@ def execute_run(
         findings.extend(_analyze_tool_performance(db, tasks, cutoff))
         findings.extend(_analyze_verification_patterns(db, tasks))
         findings.extend(_analyze_retry_patterns(db, tasks))
+        findings.extend(_analyze_high_performing_tools(db, tasks, cutoff))
+        findings.extend(_analyze_family_velocity(tasks))
+        findings.extend(_analyze_evidence_richness(db, tasks, cutoff))
 
         # Persist findings
         for f in findings:
@@ -279,6 +282,159 @@ def _analyze_retry_patterns(db, tasks: list[dict]) -> list[dict]:
             },
             "suggestion": "High retry rate — plans may be under-specified or verifier too strict on first pass",
         })
+
+    return findings
+
+
+def _analyze_high_performing_tools(db, tasks: list[dict], cutoff: float) -> list[dict]:
+    """Surface tools with unusually high success correlation.
+
+    Counterpart to _analyze_tool_performance which only fires on failure
+    patterns. A healthy system produces no findings there, but we still
+    want positive signal (capability promotion candidates).
+    """
+    findings = []
+    rows = db._conn.execute(
+        """SELECT e.tool_name, t.status, COUNT(*) AS cnt
+           FROM evidence_records e
+           JOIN tasks t ON e.task_id = t.id
+           WHERE t.created_at >= ? AND e.tool_name IS NOT NULL
+           GROUP BY e.tool_name, t.status""",
+        (cutoff,),
+    ).fetchall()
+
+    stats: dict[str, dict] = {}
+    for r in rows:
+        s = stats.setdefault(r["tool_name"], {"completed": 0, "failed": 0, "other": 0})
+        if r["status"] == "completed":
+            s["completed"] += r["cnt"]
+        elif r["status"] == "failed":
+            s["failed"] += r["cnt"]
+        else:
+            s["other"] += r["cnt"]
+
+    for tool, s in stats.items():
+        total = s["completed"] + s["failed"]
+        if total >= 10:
+            rate = s["completed"] / total
+            if rate >= 0.9:
+                findings.append({
+                    "type": "high_performing_tool",
+                    "task_family": None,
+                    "confidence": min(0.7 + total * 0.01, 0.95),
+                    "impact": rate * total * 0.2,
+                    "detail": {"tool": tool, "success_rate": rate, **s},
+                    "suggestion": f"Tool '{tool}' succeeds {rate:.0%} over {total} uses — candidate for capability promotion / skill extraction",
+                })
+    return findings
+
+
+def _analyze_family_velocity(tasks: list[dict]) -> list[dict]:
+    """Per-family median time-to-complete. Slow families = optimization
+    targets; consistently fast families = best-practice templates."""
+    findings = []
+
+    durations: dict[str, list[float]] = {}
+    for t in tasks:
+        if t.get("status") != "completed":
+            continue
+        started, completed = t.get("started_at"), t.get("completed_at")
+        if not started or not completed or completed <= started:
+            continue
+        durations.setdefault(t.get("task_type", "general"), []).append(completed - started)
+
+    # Need at least 2 families with ≥5 completed tasks each to compare
+    qualifying = {fam: ds for fam, ds in durations.items() if len(ds) >= 5}
+    if len(qualifying) < 2:
+        return findings
+
+    # Use the fastest family as baseline so ratios surface even when the
+    # distribution is relatively tight (real data tends to cluster within
+    # a factor of 2 — a strict 2x cutoff produces nothing useful).
+    medians = {fam: sorted(ds)[len(ds) // 2] for fam, ds in qualifying.items()}
+    baseline = min(medians.values())
+    overall_median = sorted(medians.values())[len(medians) // 2]
+    if baseline <= 0:
+        return findings
+
+    for fam, med in medians.items():
+        ratio = med / baseline
+        if ratio <= 1.1:  # fastest (within 10% of the min)
+            findings.append({
+                "type": "fast_family",
+                "task_family": fam,
+                "confidence": 0.75,
+                "impact": len(qualifying[fam]) * 0.3,
+                "detail": {
+                    "median_duration_s": round(med, 1),
+                    "baseline_median_s": round(baseline, 1),
+                    "overall_median_s": round(overall_median, 1),
+                    "sample_size": len(qualifying[fam]),
+                },
+                "suggestion": f"Family '{fam}' is the fastest cohort ({med:.0f}s median) — extract its plan pattern as a reusable template",
+            })
+        elif ratio >= 1.5:
+            findings.append({
+                "type": "slow_family",
+                "task_family": fam,
+                "confidence": 0.75,
+                "impact": len(qualifying[fam]) * 0.4,
+                "detail": {
+                    "median_duration_s": round(med, 1),
+                    "baseline_median_s": round(baseline, 1),
+                    "overall_median_s": round(overall_median, 1),
+                    "sample_size": len(qualifying[fam]),
+                },
+                "suggestion": f"Family '{fam}' takes {med:.0f}s (median), {ratio:.1f}x slower than the fastest cohort — planner may be under-decomposing",
+            })
+
+    return findings
+
+
+def _analyze_evidence_richness(db, tasks: list[dict], cutoff: float) -> list[dict]:
+    """Find tasks that accumulated an unusual amount of evidence — those
+    task families are rich extraction targets for new skills / precedents."""
+    findings = []
+    rows = db._conn.execute(
+        """SELECT t.task_type, COUNT(e.id) AS evidence_count, COUNT(DISTINCT t.id) AS task_count
+           FROM tasks t
+           LEFT JOIN evidence_records e ON e.task_id = t.id
+           WHERE t.created_at >= ? AND t.status = 'completed'
+           GROUP BY t.task_type
+           HAVING task_count >= 3""",
+        (cutoff,),
+    ).fetchall()
+
+    by_family = {r["task_type"]: (r["evidence_count"], r["task_count"]) for r in rows}
+    if not by_family:
+        return findings
+
+    avgs = {fam: (ec / tc) if tc else 0.0 for fam, (ec, tc) in by_family.items()}
+    if len(avgs) < 2:
+        return findings
+    # Use the lowest-evidence family as baseline so richer cohorts surface
+    # at realistic ratios (real data rarely has a 2x spread over the median).
+    baseline = min(v for v in avgs.values() if v > 0) if any(v > 0 for v in avgs.values()) else 0
+    if baseline <= 0:
+        return findings
+
+    for fam, avg in avgs.items():
+        ratio = avg / baseline
+        if ratio >= 1.5:
+            ec, tc = by_family[fam]
+            findings.append({
+                "type": "evidence_rich_family",
+                "task_family": fam,
+                "confidence": 0.7,
+                "impact": avg * 0.1,
+                "detail": {
+                    "avg_evidence_per_task": round(avg, 1),
+                    "baseline_avg": round(baseline, 1),
+                    "task_count": tc,
+                    "total_evidence": ec,
+                },
+                "suggestion": f"Family '{fam}' averages {avg:.1f} evidence/task ({ratio:.1f}x the leanest cohort) — candidate for skill/precedent extraction",
+            })
 
     return findings
 
