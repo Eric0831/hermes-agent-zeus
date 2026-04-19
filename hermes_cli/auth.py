@@ -717,7 +717,7 @@ def resolve_provider(
 
     # Check auth store for an active OAuth provider
     try:
-        auth_store = _load_auth_store()
+        auth_store=_load_auth_store()
         active = auth_store.get("active_provider")
         if active and active in PROVIDER_REGISTRY:
             status = get_auth_status(active)
@@ -741,6 +741,34 @@ def resolve_provider(
         for env_var in pconfig.api_key_env_vars:
             if has_usable_secret(os.getenv(env_var, "")):
                 return pid
+
+    # ZEUS FIX: Check config.yaml for model.provider setting
+    try:
+        from hermes_cli.runtime_provider import _get_model_config
+        model_cfg = _get_model_config()
+        cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
+        if cfg_provider and cfg_provider != "auto":
+            # Normalize provider name
+            _PROVIDER_ALIASES = {
+                "glm": "zai", "z-ai": "zai", "z.ai": "zai", "zhipu": "zai",
+                "kimi": "kimi-coding", "moonshot": "kimi-coding",
+                "minimax-china": "minimax-cn", "minimax_cn": "minimax-cn",
+                "claude": "anthropic", "claude-code": "anthropic",
+                "github": "copilot", "github-copilot": "copilot",
+                "github-models": "copilot", "github-model": "copilot",
+                "github-copilot-acp": "copilot-acp", "copilot-acp-agent": "copilot-acp",
+                "aigateway": "ai-gateway", "vercel": "ai-gateway", "vercel-ai-gateway": "ai-gateway",
+                "opencode": "opencode-zen", "zen": "opencode-zen",
+                "hf": "huggingface", "hugging-face": "huggingface", "huggingface-hub": "huggingface",
+                "go": "opencode-go", "opencode-go-sub": "opencode-go",
+                "kilo": "kilocode", "kilo-code": "kilocode", "kilo-gateway": "kilocode",
+            }
+            normalized_provider = _PROVIDER_ALIASES.get(cfg_provider, cfg_provider)
+            if normalized_provider in PROVIDER_REGISTRY or normalized_provider == "custom":
+                logger.info(f"Using provider from config.yaml: {normalized_provider}")
+                return normalized_provider
+    except Exception as e:
+        logger.debug(f"Could not read provider from config: {e}")
 
     return "openrouter"
 

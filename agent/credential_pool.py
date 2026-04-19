@@ -24,9 +24,53 @@ from hermes_cli.auth import (
     _is_expiring,
     _load_auth_store,
     _load_provider_state,
-    read_credential_pool,
-    write_credential_pool,
 )
+
+# --- Shim for read_credential_pool / write_credential_pool ---
+# These functions were removed from hermes_cli.auth upstream.
+# Re-implemented locally using the same _load_auth_store / _save_auth_store pattern.
+
+import json as _json
+from pathlib import Path as _Path
+
+
+def _auth_file_path() -> _Path:
+    try:
+        from hermes_constants import get_hermes_home
+        return get_hermes_home() / "auth.json"
+    except ImportError:
+        return _Path.home() / ".hermes" / "auth.json"
+
+
+def read_credential_pool(provider: Optional[str]) -> Dict[str, Any]:
+    """Read credential pool entries from auth.json.
+
+    If provider is None, return the entire credential_pools dict.
+    If provider is given, return the list of entries for that provider.
+    """
+    auth_store = _load_auth_store()
+    pools = auth_store.get("credential_pools", {})
+    if provider is None:
+        return pools
+    return pools.get(provider, [])
+
+
+def write_credential_pool(provider: str, entries: List[Dict[str, Any]]) -> None:
+    """Write credential pool entries to auth.json for a specific provider."""
+    auth_store = _load_auth_store()
+    if "credential_pools" not in auth_store:
+        auth_store["credential_pools"] = {}
+    auth_store["credential_pools"][provider] = entries
+    # Use the upstream save pattern
+    try:
+        from hermes_cli.auth import _save_auth_store
+        _save_auth_store(auth_store)
+    except ImportError:
+        # Fallback: direct write
+        auth_file = _auth_file_path()
+        auth_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(auth_file, "w", encoding="utf-8") as f:
+            f.write(_json.dumps(auth_store, indent=2) + "\n")
 
 logger = logging.getLogger(__name__)
 
