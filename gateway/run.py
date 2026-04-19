@@ -5636,10 +5636,19 @@ class GatewayRunner:
         logger.info("[Brain] Task %s created: type=%s risk=%s",
                      task_id, triage_result.task_type, triage_result.risk_level)
 
-        # 2. Generate plan
+        # 2. Generate plan — feed current session world state so the
+        # Planner can account for active tasks / open loops / risks and
+        # avoid duplicating work already in flight.
+        try:
+            from brain.world_state import get_world_state_summary
+            world_context = get_world_state_summary(db, session_id)
+        except Exception as _ws_exc:
+            logger.debug("[Brain] world_state summary unavailable: %s", _ws_exc)
+            world_context = ""
         plan = generate_plan(
             goal=message_text,
             task_type=triage_result.task_type,
+            context=world_context,
             llm_call=self._brain_planner_llm_call(),
         )
         task_store.update_task_status(
