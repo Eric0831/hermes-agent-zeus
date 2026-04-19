@@ -1,0 +1,14 @@
+[Unit]
+Description=Hermes Federation Skill Auto-Promote (candidates → active)
+After=network.target hermes-meta-learning-cycle.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/testai/.hermes/hermes-agent
+Environment="PATH=/home/testai/.hermes/hermes-agent/venv/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/home/testai/.hermes/hermes-agent/venv/bin/python /home/testai/.hermes/hermes-agent/scripts/hermes_skill_auto_promote.py --apply
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

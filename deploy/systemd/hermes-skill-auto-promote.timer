@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Hermes Federation Skill Auto-Promote Daily at 04:45
+
+[Timer]
+OnCalendar=*-*-* 04:45:00
+Persistent=true
+RandomizedDelaySec=5m
+Unit=hermes-skill-auto-promote.service
+
+[Install]
+WantedBy=timers.target
