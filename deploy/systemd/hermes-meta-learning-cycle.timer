@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Hermes Federation Meta-Learning Cycle Daily at 03:30
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+RandomizedDelaySec=5m
+Unit=hermes-meta-learning-cycle.service
+
+[Install]
+WantedBy=timers.target
