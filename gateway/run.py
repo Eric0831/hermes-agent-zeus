@@ -3378,6 +3378,23 @@ class GatewayRunner:
                 except Exception as e:
                     return f"Approve failed: {e}"
 
+            # /tasks clusters — federation roster + trust scores
+            if args == "clusters":
+                try:
+                    from brain.agent_society import get_all_clusters
+                    clusters = get_all_clusters(db, status='active')
+                    lines = [f"**Federation Clusters** ({len(clusters)} active)", ""]
+                    for c in sorted(clusters, key=lambda c: (-float(c.get('trust_score') or 0), c.get('cluster_name', ''))):
+                        lines.append(
+                            f"  {c['cluster_name']:18s} "
+                            f"authority={c.get('authority_level', '-'):13s} "
+                            f"trust={float(c.get('trust_score') or 0):.3f}  "
+                            f"{(c.get('jurisdiction_json') or '')[:60]}"
+                        )
+                    return "\n".join(lines)
+                except Exception as e:
+                    return f"Clusters listing failed: {e}"
+
             # /tasks governance [limit] — recent governance_reviews (audit)
             if args.startswith("governance"):
                 try:

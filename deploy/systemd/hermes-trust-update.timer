@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Hermes Federation Trust Update Daily at 04:30
+
+[Timer]
+OnCalendar=*-*-* 04:30:00
+Persistent=true
+RandomizedDelaySec=5m
+Unit=hermes-trust-update.service
+
+[Install]
+WantedBy=timers.target
