@@ -36,16 +36,38 @@ def git(*args: str) -> str:
     return r.stdout.strip()
 
 
-def classify(files: list[str], fork_files: set[str]) -> str:
+def classify(
+    files: list[str],
+    fork_files: set[str],
+    tracked_files: set[str],
+) -> str:
     if not files:
         return "empty"
+    # (1) Any file our fork has changed since merge-base → likely content
+    #     conflict even if it looks "docs-y"
     if any(f in fork_files for f in files):
         return "conflict"
+    # (2) Any file we don't currently track at all → upstream will try to
+    #     patch a path that doesn't exist on our side. Mark it conflict
+    #     so the operator sees it before attempting cherry-pick. (Pure
+    #     additions — upstream creates a brand-new file — aren't caught
+    #     here; those pass through as safe, which is the right behaviour.)
+    for f in files:
+        if f not in tracked_files and not _looks_like_new_file(f):
+            return "missing_local"
     if all(f.startswith("docs/") or f.endswith(".md") for f in files):
         return "docs"
     if all(f.startswith("tests/") for f in files):
         return "tests"
     return "safe"
+
+
+def _looks_like_new_file(_path: str) -> bool:
+    """Heuristic: we can't distinguish 'new file in upstream' from
+    'file we deleted' without more git plumbing. For now treat every
+    not-tracked path as potentially missing — the operator can still
+    pick it manually if it really is a brand-new file."""
+    return False
 
 
 def main() -> int:
@@ -62,8 +84,10 @@ def main() -> int:
         return 1
 
     fork_files = set(git("diff", "--name-only", f"{merge_base}..main").split())
+    tracked_files = set(git("ls-tree", "-r", "--name-only", "main").split())
     print(f"Fork merge-base: {merge_base}")
-    print(f"Fork-modified files: {len(fork_files)}")
+    print(f"Fork-modified files: {len(fork_files)}  "
+          f"Tracked files: {len(tracked_files)}")
     print()
 
     log = git(
@@ -82,7 +106,7 @@ def main() -> int:
         sha, _, msg = row.partition("\t")
         files = git("show", "--stat=1000", "--name-only", "--format=", sha).splitlines()
         files = [f for f in files if f]
-        cat = classify(files, fork_files)
+        cat = classify(files, fork_files, tracked_files)
         category_tally[cat] += 1
         lines.append((cat, sha, msg, files))
 
@@ -91,7 +115,7 @@ def main() -> int:
         print(f"  {c:10s} {n}")
     print()
 
-    showable = {"safe", "docs", "tests"} if args.min_safe else {"safe", "docs", "tests", "conflict"}
+    showable = {"safe", "docs", "tests"} if args.min_safe else {"safe", "docs", "tests", "conflict", "missing_local"}
     print(f"Showing {sum(1 for l in lines if l[0] in showable)} / {len(lines)} commits:")
     print()
     for cat, sha, msg, files in lines:
