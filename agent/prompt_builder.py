@@ -152,7 +152,24 @@ MEMORY_GUIDANCE = (
     "Do NOT save task progress, session outcomes, completed-work logs, or temporary TODO "
     "state to memory; use session_search to recall those from past transcripts. "
     "If you've discovered a new way to do something, solved a problem that could be "
-    "necessary later, save it as a skill with the skill tool."
+    "necessary later, save it as a skill with the skill tool.\n"
+    "Record from success AND failure: if you only save corrections, you avoid past mistakes "
+    "but drift from validated approaches. When the user confirms a non-obvious approach "
+    "('yes exactly', 'perfect'), save what worked and why."
+)
+
+DELEGATION_GUIDANCE = (
+    "When delegating to subagents or spawning parallel tasks:\n"
+    "- Never write 'based on your findings' or 'based on the research' — these delegate "
+    "understanding. YOU must synthesize findings into specific instructions with file paths, "
+    "line numbers, and exactly what to change.\n"
+    "- After research completes: read findings, understand the problem, then write a "
+    "concrete spec proving you understood.\n"
+    "- Continue vs Spawn: high context overlap → continue existing agent; "
+    "low overlap, fresh verification, or wrong direction → spawn fresh.\n"
+    "- Read-only tasks (research) → run in parallel freely. "
+    "Write-heavy tasks → one at a time per set of files.\n"
+    "- Verification means proving code works, not confirming it exists."
 )
 
 SESSION_SEARCH_GUIDANCE = (

@@ -1151,7 +1151,12 @@ class AIAgent:
         compression_enabled = str(_compression_cfg.get("enabled", True)).lower() in ("true", "1", "yes")
         compression_summary_model = _compression_cfg.get("summary_model") or None
         compression_target_ratio = float(_compression_cfg.get("target_ratio", 0.20))
-        compression_protect_last = int(_compression_cfg.get("protect_last_n", 20))
+        compression_protect_last = int(
+            _compression_cfg.get(
+                "protect_last_n",
+                _compression_cfg.get("protect_last", 20),
+            )
+        )
 
         # Read explicit context_length override from model config
         _model_cfg = _agent_cfg.get("model", {})
@@ -5252,6 +5257,11 @@ class AIAgent:
 
         compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens)
 
+        return self._finalize_compressed_rollover(compressed, system_message)
+
+    def _finalize_compressed_rollover(self, compressed: list, system_message: str) -> tuple:
+        """Persist a compressed transcript into a fresh continuation session."""
+
         todo_snapshot = self._todo_store.format_for_injection()
         if todo_snapshot:
             compressed.append({"role": "user", "content": todo_snapshot})
@@ -5299,6 +5309,65 @@ class AIAgent:
         self.context_compressor.last_completion_tokens = 0
 
         return compressed, new_system_prompt
+
+    def _force_context_rollover(
+        self, messages: list, system_message: str, *, approx_tokens: int | None = None
+    ) -> tuple | None:
+        """Attempt one last, more aggressive rollover before aborting a turn.
+
+        This is a safety valve for long-lived gateway sessions, especially
+        Telegram threads, where the default compaction policy may preserve too
+        much recent tail to make progress. We temporarily shrink the protected
+        tail and tail token budget, produce a smaller handoff transcript, then
+        continue in a fresh session instead of returning a terminal error.
+        """
+        compressor = getattr(self, "context_compressor", None)
+        if compressor is None:
+            return None
+
+        original_protect_last = compressor.protect_last_n
+        original_ratio = compressor.summary_target_ratio
+        original_tail_budget = compressor.tail_token_budget
+
+        candidate_last_values = []
+        for value in (12, 8, 4, 2):
+            value = min(original_protect_last, value)
+            if value >= 1 and value not in candidate_last_values:
+                candidate_last_values.append(value)
+
+        if not candidate_last_values:
+            return None
+
+        try:
+            for target_last in candidate_last_values:
+                target_ratio = 0.10 if target_last <= 4 else 0.15
+                target_ratio = min(original_ratio, target_ratio)
+
+                compressor.protect_last_n = target_last
+                compressor.summary_target_ratio = target_ratio
+                compressor.tail_token_budget = int(
+                    compressor.threshold_tokens * target_ratio
+                )
+
+                candidate = compressor.compress(messages, current_tokens=approx_tokens)
+                if len(candidate) < len(messages):
+                    logger.warning(
+                        "Forced context rollover succeeded: protect_last_n %s -> %s, "
+                        "tail budget %s -> %s, messages %s -> %s",
+                        original_protect_last,
+                        target_last,
+                        original_tail_budget,
+                        compressor.tail_token_budget,
+                        len(messages),
+                        len(candidate),
+                    )
+                    return self._finalize_compressed_rollover(candidate, system_message)
+        finally:
+            compressor.protect_last_n = original_protect_last
+            compressor.summary_target_ratio = original_ratio
+            compressor.tail_token_budget = original_tail_budget
+
+        return None
 
     def _execute_tool_calls(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
         """Execute tool calls from the assistant message and append results to messages.
@@ -7098,6 +7167,29 @@ class AIAgent:
                             retry_count = 0
                             continue
 
+                    # Local custom backends should fail over quickly on read timeouts.
+                    # Retries against the same localhost model can block Telegram/event
+                    # handling for a long time without improving success odds.
+                    _base_str = str(_base).lower()
+                    is_local_custom_primary = (
+                        str(_provider).lower() == "custom"
+                        and (
+                            _base_str.startswith("http://localhost")
+                            or _base_str.startswith("http://127.0.0.1")
+                            or _base_str.startswith("https://localhost")
+                            or _base_str.startswith("https://127.0.0.1")
+                        )
+                    )
+                    is_timeout_error = (
+                        error_code == "timeout"
+                        or error_type in {"ReadTimeout", "TimeoutException"}
+                    )
+                    if is_timeout_error and is_local_custom_primary and not self._fallback_activated:
+                        self._emit_status("⚠️ Local model timed out — switching to fallback...")
+                        if self._try_activate_fallback():
+                            retry_count = 0
+                            continue
+
                     is_payload_too_large = error_code == "payload_too_large"
 
                     if is_payload_too_large:
@@ -7105,6 +7197,15 @@ class AIAgent:
                         if compression_attempts > max_compression_attempts:
                             self._vprint(f"{self.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached for payload-too-large error.", force=True)
                             logging.error(f"{self.log_prefix}413 compression failed after {max_compression_attempts} attempts.")
+                            forced_rollover = self._force_context_rollover(
+                                messages, system_message, approx_tokens=approx_tokens
+                            )
+                            if forced_rollover is not None:
+                                messages, active_system_prompt = forced_rollover
+                                compression_attempts = 0
+                                self._emit_status("🪓 Forced session rollover applied after repeated payload overflow; continuing in a fresh session...")
+                                restart_with_compressed_messages = True
+                                break
                             self._persist_session(messages, conversation_history)
                             return {
                                 "messages": messages,
@@ -7130,6 +7231,15 @@ class AIAgent:
                         else:
                             self._vprint(f"{self.log_prefix}❌ Payload too large and cannot compress further.", force=True)
                             logging.error(f"{self.log_prefix}413 payload too large. Cannot compress further.")
+                            forced_rollover = self._force_context_rollover(
+                                messages, system_message, approx_tokens=approx_tokens
+                            )
+                            if forced_rollover is not None:
+                                messages, active_system_prompt = forced_rollover
+                                compression_attempts = 0
+                                self._emit_status("🪓 Forced session rollover applied after payload overflow; continuing in a fresh session...")
+                                restart_with_compressed_messages = True
+                                break
                             self._persist_session(messages, conversation_history)
                             return {
                                 "messages": messages,
@@ -7233,6 +7343,15 @@ class AIAgent:
                         if compression_attempts > max_compression_attempts:
                             self._vprint(f"{self.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached.", force=True)
                             logging.error(f"{self.log_prefix}Context compression failed after {max_compression_attempts} attempts.")
+                            forced_rollover = self._force_context_rollover(
+                                messages, system_message, approx_tokens=approx_tokens
+                            )
+                            if forced_rollover is not None:
+                                messages, active_system_prompt = forced_rollover
+                                compression_attempts = 0
+                                self._emit_status("🪓 Forced session rollover applied after repeated context overflow; continuing in a fresh session...")
+                                restart_with_compressed_messages = True
+                                break
                             self._persist_session(messages, conversation_history)
                             return {
                                 "messages": messages,
@@ -7261,6 +7380,15 @@ class AIAgent:
                             self._vprint(f"{self.log_prefix}❌ Context length exceeded and cannot compress further.", force=True)
                             self._vprint(f"{self.log_prefix}   💡 The conversation has accumulated too much content.", force=True)
                             logging.error(f"{self.log_prefix}Context length exceeded: {approx_tokens:,} tokens. Cannot compress further.")
+                            forced_rollover = self._force_context_rollover(
+                                messages, system_message, approx_tokens=approx_tokens
+                            )
+                            if forced_rollover is not None:
+                                messages, active_system_prompt = forced_rollover
+                                compression_attempts = 0
+                                self._emit_status("🪓 Forced session rollover applied after context overflow; continuing in a fresh session...")
+                                restart_with_compressed_messages = True
+                                break
                             self._persist_session(messages, conversation_history)
                             return {
                                 "messages": messages,
@@ -8201,9 +8329,9 @@ class AIAgent:
 
 def main(
     query: str = None,
-    model: str = "anthropic/claude-opus-4.6",
+    model: str = None,  # Read from config.yaml if not specified
     api_key: str = None,
-    base_url: str = "https://openrouter.ai/api/v1",
+    base_url: str = None,  # Read from config.yaml if not specified
     max_turns: int = 10,
     enabled_toolsets: str = None,
     disabled_toolsets: str = None,
@@ -8337,6 +8465,25 @@ def main(
         print("💾 Trajectory saving: ENABLED")
         print("   - Successful conversations → trajectory_samples.jsonl")
         print("   - Failed conversations → failed_trajectories.jsonl")
+    
+    # ZEUS FIX: Load model settings from config.yaml if not specified
+    if model is None or base_url is None:
+        try:
+            from hermes_cli.runtime_provider import _get_model_config
+            model_cfg = _get_model_config()
+            if model is None:
+                model = model_cfg.get("default", "anthropic/claude-opus-4.6")
+            if base_url is None:
+                base_url = model_cfg.get("base_url", "https://openrouter.ai/api/v1")
+            if api_key is None and model_cfg.get("api_key"):
+                api_key = model_cfg.get("api_key")
+            print(f"⚙️  Loaded model config from config.yaml: {model} @ {base_url}")
+        except Exception as e:
+            print(f"⚠️  Could not load config.yaml: {e}, using defaults")
+            if model is None:
+                model = "anthropic/claude-opus-4.6"
+            if base_url is None:
+                base_url = "https://openrouter.ai/api/v1"
     
     # Initialize agent with provided parameters
     try:
