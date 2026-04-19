@@ -29,6 +29,7 @@ from model_tools import handle_function_call
 # making tool calls). Too small = thread pool starvation, tasks queue for minutes.
 # Resized at runtime by HermesAgentBaseEnv.__init__ via resize_tool_pool().
 _tool_executor = concurrent.futures.ThreadPoolExecutor(max_workers=128)
+_REPEATED_TOOL_CALL_ABORT_THRESHOLD = 3
 
 
 def resize_tool_pool(max_workers: int):
@@ -192,6 +193,8 @@ class HermesAgentLoop:
                 break
 
         import time as _time
+        last_tool_signature: Optional[str] = None
+        repeated_tool_signature_count = 0
 
         for turn in range(self.max_turns):
             turn_start = _time.monotonic()
@@ -326,6 +329,49 @@ class HermesAgentLoop:
                     else:
                         tool_name = tc.function.name
                         tool_args_raw = tc.function.arguments
+
+                    # Abort obvious tool-call loops before executing the same
+                    # tool with the same arguments over and over.
+                    tool_signature = f"{tool_name}:{tool_args_raw}"
+                    if tool_signature == last_tool_signature:
+                        repeated_tool_signature_count += 1
+                    else:
+                        last_tool_signature = tool_signature
+                        repeated_tool_signature_count = 1
+
+                    if repeated_tool_signature_count >= _REPEATED_TOOL_CALL_ABORT_THRESHOLD:
+                        loop_msg = (
+                            f"Aborted repeated tool-call loop: '{tool_name}' was requested "
+                            f"{repeated_tool_signature_count} times in a row with the same arguments."
+                        )
+                        tool_errors.append(ToolError(
+                            turn=turn + 1,
+                            tool_name=tool_name,
+                            arguments=tool_args_raw[:200],
+                            error=loop_msg,
+                            tool_result=json.dumps({"error": loop_msg}),
+                        ))
+                        logger.warning(
+                            "[%s] turn %d: repeated tool-call loop detected for %s",
+                            self.task_id[:8], turn + 1, tool_name,
+                        )
+                        messages.append(
+                            {
+                                "role": "assistant",
+                                "content": (
+                                    "I stopped because I was looping on the same tool call "
+                                    f"('{tool_name}') instead of making progress."
+                                ),
+                            }
+                        )
+                        return AgentResult(
+                            messages=messages,
+                            managed_state=self._get_managed_state(),
+                            turns_used=turn + 1,
+                            finished_naturally=False,
+                            reasoning_per_turn=reasoning_per_turn,
+                            tool_errors=tool_errors,
+                        )
 
                     # Validate tool name
                     if tool_name not in self.valid_tool_names:
