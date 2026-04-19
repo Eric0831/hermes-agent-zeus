@@ -1301,6 +1301,179 @@ def _normalize_max_turns_config(config: Dict[str, Any]) -> Dict[str, Any]:
     return config
 
 
+def _candidate_zeus_roots() -> List[Path]:
+    roots: List[Path] = []
+    env_root = os.getenv("ZEUS_ROOT", "").strip()
+    if env_root:
+        roots.append(Path(env_root).expanduser())
+
+    try:
+        sibling_root = Path(__file__).resolve().parents[3] / "zeus"
+        roots.append(sibling_root)
+    except Exception:
+        pass
+
+    cwd_root = Path.cwd() / "zeus"
+    roots.append(cwd_root)
+
+    seen = set()
+    unique_roots: List[Path] = []
+    for root in roots:
+        resolved = root.resolve(strict=False)
+        key = str(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_roots.append(resolved)
+    return unique_roots
+
+
+def _load_zeus_llm_models() -> Dict[str, Dict[str, Any]]:
+    for root in _candidate_zeus_roots():
+        llm_path = root / "config" / "prod" / "llm.yaml"
+        if not llm_path.exists():
+            continue
+        try:
+            with open(llm_path, encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+        except Exception:
+            continue
+        models = data.get("models")
+        if isinstance(models, dict):
+            return models
+    return {}
+
+
+def _base_url_from_target_url(url: str) -> str:
+    value = str(url or "").strip().rstrip("/")
+    if not value:
+        return ""
+    if "/v1/" in value:
+        return value.split("/v1/", 1)[0] + "/v1"
+    return value
+
+
+def _resolve_zeus_tier_target(tier: Any) -> Dict[str, str]:
+    tier_name = str(tier or "").strip()
+    if not tier_name:
+        return {}
+    entry = _load_zeus_llm_models().get(tier_name)
+    if not isinstance(entry, dict):
+        return {}
+    model = str(entry.get("model") or "").strip()
+    base_url = _base_url_from_target_url(str(entry.get("url") or ""))
+    if not model or not base_url:
+        return {}
+    return {
+        "provider": "custom",
+        "model": model,
+        "base_url": base_url,
+        "api_key": "local",
+    }
+
+
+def _apply_tier_to_model_section(section: Any, tier: Any) -> Dict[str, Any]:
+    resolved = _resolve_zeus_tier_target(tier)
+    if not resolved:
+        if isinstance(section, dict):
+            return dict(section)
+        return {}
+
+    if isinstance(section, dict):
+        merged = dict(section)
+    else:
+        merged = {}
+
+    for key, value in resolved.items():
+        existing = str(merged.get(key) or "").strip()
+        if not existing:
+            merged[key] = value
+
+    if not str(merged.get("default") or "").strip():
+        merged["default"] = resolved["model"]
+    return merged
+
+
+def _apply_tier_to_compression_config(compression: Any, tier: Any) -> Dict[str, Any]:
+    resolved = _resolve_zeus_tier_target(tier)
+    if isinstance(compression, dict):
+        merged = dict(compression)
+    else:
+        merged = {}
+
+    if not resolved:
+        return merged
+
+    if not str(merged.get("summary_model") or "").strip():
+        merged["summary_model"] = resolved["model"]
+    if not str(merged.get("summary_provider") or "").strip():
+        merged["summary_provider"] = resolved["provider"]
+    if not str(merged.get("summary_base_url") or "").strip():
+        merged["summary_base_url"] = resolved["base_url"]
+    return merged
+
+
+def _apply_model_tier_overrides(config: Dict[str, Any]) -> Dict[str, Any]:
+    config = dict(config)
+
+    model_tier = config.get("model_tier")
+    if model_tier:
+        model_cfg = config.get("model")
+        if isinstance(model_cfg, dict):
+            config["model"] = _apply_tier_to_model_section(model_cfg, model_tier)
+        else:
+            config["model"] = _apply_tier_to_model_section({}, model_tier)
+
+    fallback_tier = config.get("fallback_tier")
+    if fallback_tier:
+        config["fallback_model"] = _apply_tier_to_model_section(
+            config.get("fallback_model"),
+            fallback_tier,
+        )
+
+    delegation = config.get("delegation")
+    if isinstance(delegation, dict) and delegation.get("model_tier"):
+        config["delegation"] = _apply_tier_to_model_section(
+            delegation,
+            delegation.get("model_tier"),
+        )
+
+    smart_routing = config.get("smart_model_routing")
+    if isinstance(smart_routing, dict):
+        cheap_model = smart_routing.get("cheap_model")
+        if isinstance(cheap_model, dict) and cheap_model.get("model_tier"):
+            updated_smart_routing = dict(smart_routing)
+            updated_smart_routing["cheap_model"] = _apply_tier_to_model_section(
+                cheap_model,
+                cheap_model.get("model_tier"),
+            )
+            config["smart_model_routing"] = updated_smart_routing
+
+    compression = config.get("compression")
+    if isinstance(compression, dict) and compression.get("summary_tier"):
+        config["compression"] = _apply_tier_to_compression_config(
+            compression,
+            compression.get("summary_tier"),
+        )
+
+    auxiliary = config.get("auxiliary")
+    if isinstance(auxiliary, dict):
+        updated_auxiliary = dict(auxiliary)
+        changed = False
+        for task_name, task_cfg in auxiliary.items():
+            if not isinstance(task_cfg, dict) or not task_cfg.get("model_tier"):
+                continue
+            updated_auxiliary[task_name] = _apply_tier_to_model_section(
+                task_cfg,
+                task_cfg.get("model_tier"),
+            )
+            changed = True
+        if changed:
+            config["auxiliary"] = updated_auxiliary
+
+    return config
+
+
 
 def load_config() -> Dict[str, Any]:
     """Load configuration from ~/.hermes/config.yaml."""
@@ -1326,7 +1499,9 @@ def load_config() -> Dict[str, Any]:
         except Exception as e:
             print(f"Warning: Failed to load config: {e}")
     
-    return _expand_env_vars(_normalize_max_turns_config(config))
+    config = _normalize_max_turns_config(config)
+    config = _apply_model_tier_overrides(config)
+    return _expand_env_vars(config)
 
 
 _SECURITY_COMMENT = """

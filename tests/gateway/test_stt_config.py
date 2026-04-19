@@ -1,5 +1,6 @@
 """Gateway STT config tests — honor stt.enabled: false from config.yaml."""
 
+import importlib
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -28,6 +29,55 @@ def test_load_gateway_config_bridges_stt_enabled_from_config_yaml(tmp_path, monk
     config = load_gateway_config()
 
     assert config.stt_enabled is False
+
+
+def test_gateway_run_load_config_expands_tier_based_model(tmp_path, monkeypatch):
+    hermes_home = tmp_path / ".hermes"
+    zeus_root = tmp_path / "zeus"
+    hermes_home.mkdir()
+    (zeus_root / "config" / "prod").mkdir(parents=True)
+
+    (hermes_home / "config.yaml").write_text(
+        yaml.dump(
+            {
+                "model_tier": "standard",
+                "model": {},
+                "compression": {"summary_tier": "fast"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (zeus_root / "config" / "prod" / "llm.yaml").write_text(
+        yaml.dump(
+            {
+                "models": {
+                    "standard": {
+                        "url": "http://localhost:8100/v1/chat/completions",
+                        "model": "Qwen/Qwen3.5-27B-FP8",
+                    },
+                    "fast": {
+                        "url": "http://localhost:8101/v1/chat/completions",
+                        "model": "lovedheart/Qwen3.5-9B-FP8",
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("ZEUS_ROOT", str(zeus_root))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+
+    cfg = gateway_run._load_gateway_config()
+
+    assert cfg["model"]["default"] == "Qwen/Qwen3.5-27B-FP8"
+    assert cfg["model"]["base_url"] == "http://localhost:8100/v1"
+    assert cfg["compression"]["summary_model"] == "lovedheart/Qwen3.5-9B-FP8"
+    assert gateway_run._resolve_gateway_model(cfg) == "Qwen/Qwen3.5-27B-FP8"
 
 
 @pytest.mark.asyncio

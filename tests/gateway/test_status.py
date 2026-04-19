@@ -103,6 +103,44 @@ class TestGatewayRuntimeStatus:
         assert payload["platforms"]["telegram"]["error_code"] == "telegram_polling_conflict"
         assert payload["platforms"]["telegram"]["error_message"] == "another poller is active"
 
+    def test_repair_runtime_state_for_startup_clears_stale_status_and_locks(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        state_path = tmp_path / "gateway_state.json"
+        state_path.write_text(json.dumps({
+            "pid": 99999,
+            "kind": "hermes-gateway",
+            "gateway_state": "running",
+            "platforms": {},
+        }))
+
+        monkeypatch.setattr(status, "get_running_pid", lambda: None)
+        monkeypatch.setattr(status, "release_all_scoped_locks", lambda: 3)
+
+        report = status.repair_runtime_state_for_startup()
+
+        assert report["running_pid"] is None
+        assert report["cleared_runtime_status"] is True
+        assert report["released_scoped_locks"] == 3
+        assert not state_path.exists()
+
+    def test_repair_runtime_state_for_startup_keeps_live_runtime_state(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        state_path = tmp_path / "gateway_state.json"
+        state_path.write_text(json.dumps({
+            "pid": os.getpid(),
+            "kind": "hermes-gateway",
+            "gateway_state": "running",
+            "platforms": {},
+        }))
+
+        monkeypatch.setattr(status, "get_running_pid", lambda: 12345)
+
+        report = status.repair_runtime_state_for_startup()
+
+        assert report["running_pid"] == 12345
+        assert report["cleared_runtime_status"] is False
+        assert state_path.exists()
+
 
 class TestScopedLocks:
     def test_acquire_scoped_lock_rejects_live_other_process(self, tmp_path, monkeypatch):

@@ -129,6 +129,7 @@ def _build_runtime_status_record() -> dict[str, Any]:
         "gateway_state": "starting",
         "exit_reason": None,
         "platforms": {},
+        "runtime_metadata": {},
         "updated_at": _utc_now_iso(),
     })
     return payload
@@ -192,6 +193,10 @@ def write_runtime_status(
     platform_state: Optional[str] = None,
     error_code: Optional[str] = None,
     error_message: Optional[str] = None,
+    runtime_metadata: Optional[dict[str, Any]] = None,
+    last_agent_failure: Optional[dict[str, Any]] = None,
+    last_monitor_check: Optional[dict[str, Any]] = None,
+    last_preflight_check: Optional[dict[str, Any]] = None,
 ) -> None:
     """Persist gateway runtime health information for diagnostics/status."""
     path = _get_runtime_status_path()
@@ -206,6 +211,15 @@ def write_runtime_status(
         payload["gateway_state"] = gateway_state
     if exit_reason is not None:
         payload["exit_reason"] = exit_reason
+    if runtime_metadata:
+        payload.setdefault("runtime_metadata", {})
+        payload["runtime_metadata"].update(runtime_metadata)
+    if last_agent_failure is not None:
+        payload["last_agent_failure"] = last_agent_failure
+    if last_monitor_check is not None:
+        payload["last_monitor_check"] = last_monitor_check
+    if last_preflight_check is not None:
+        payload["last_preflight_check"] = last_preflight_check
 
     if platform is not None:
         platform_payload = payload["platforms"].get(platform, {})
@@ -230,6 +244,14 @@ def remove_pid_file() -> None:
     """Remove the gateway PID file if it exists."""
     try:
         _get_pid_path().unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def remove_runtime_status_file() -> None:
+    """Remove the persisted runtime status file if it exists."""
+    try:
+        _get_runtime_status_path().unlink(missing_ok=True)
     except Exception:
         pass
 
@@ -389,3 +411,31 @@ def get_running_pid() -> Optional[int]:
 def is_gateway_running() -> bool:
     """Check if the gateway daemon is currently running."""
     return get_running_pid() is not None
+
+
+def repair_runtime_state_for_startup() -> dict[str, Any]:
+    """Repair stale gateway runtime state before starting a new instance.
+
+    This is intentionally conservative:
+    - if a live gateway still exists, do nothing
+    - if no live gateway exists, clear stale runtime status and scoped locks
+    - return a structured report for logs / tests
+    """
+    report: dict[str, Any] = {
+        "running_pid": None,
+        "cleared_runtime_status": False,
+        "released_scoped_locks": 0,
+    }
+
+    running_pid = get_running_pid()
+    report["running_pid"] = running_pid
+    if running_pid is not None:
+        return report
+
+    runtime_status = read_runtime_status()
+    if runtime_status:
+        report["cleared_runtime_status"] = True
+        remove_runtime_status_file()
+
+    report["released_scoped_locks"] = release_all_scoped_locks()
+    return report

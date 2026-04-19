@@ -1384,11 +1384,54 @@ def _runtime_health_lines() -> list[str]:
     gateway_state = state.get("gateway_state")
     exit_reason = state.get("exit_reason")
     platforms = state.get("platforms", {}) or {}
+    runtime_metadata = state.get("runtime_metadata", {}) or {}
+    last_agent_failure = state.get("last_agent_failure", {}) or {}
+    last_monitor_check = state.get("last_monitor_check", {}) or {}
+    last_preflight_check = state.get("last_preflight_check", {}) or {}
+
+    if runtime_metadata:
+        lines.append(
+            "• runtime: "
+            f"git={runtime_metadata.get('git_sha', 'unknown')} "
+            f"cfg={runtime_metadata.get('config_hash', 'unknown')} "
+            f"prompt={runtime_metadata.get('prompt_version', 'unknown')} "
+            f"model={runtime_metadata.get('model_name', 'unknown')}"
+        )
 
     for platform, pdata in platforms.items():
         if pdata.get("state") == "fatal":
             message = pdata.get("error_message") or "unknown error"
             lines.append(f"⚠ {platform}: {message}")
+
+    if last_agent_failure:
+        lines.append(
+            "⚠ Last agent failure: "
+            f"{last_agent_failure.get('error_code', 'unknown')} "
+            f"({last_agent_failure.get('platform', 'unknown')} / "
+            f"{last_agent_failure.get('session_id', 'unknown')})"
+        )
+        if last_agent_failure.get("error"):
+            lines.append(f"  {last_agent_failure.get('error')}")
+
+    if last_monitor_check:
+        lines.append(
+            "• monitor: "
+            f"{last_monitor_check.get('action', 'unknown')} "
+            f"reason={last_monitor_check.get('reason', 'unknown')} "
+            f"health={last_monitor_check.get('health', 'unknown')} "
+            f"restarts={last_monitor_check.get('restart_count_window', '0')}/"
+            f"{last_monitor_check.get('restart_budget_max', '?')}"
+        )
+
+    if last_preflight_check:
+        issue_count = len(last_preflight_check.get("issues", []) or [])
+        mismatch_count = len(last_preflight_check.get("mismatches", {}) or {})
+        lines.append(
+            "• preflight: "
+            f"{last_preflight_check.get('status', 'unknown')} "
+            f"exit={last_preflight_check.get('exit_code', '?')} "
+            f"issues={issue_count} mismatches={mismatch_count}"
+        )
 
     if gateway_state == "startup_failed" and exit_reason:
         lines.append(f"⚠ Last startup issue: {exit_reason}")

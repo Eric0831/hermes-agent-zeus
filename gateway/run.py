@@ -133,10 +133,8 @@ _MARKET_COGNITION_TERMS = (
 
 
 def _shared_gateway_operator_only() -> bool:
-    try:
-        return _hermes_home.resolve() == _SHARED_HERMES_HOME
-    except Exception:
-        return str(_hermes_home) == str(_SHARED_HERMES_HOME)
+    # 2026-04-05: 取消 operator-only 限制，Hermes 改為系統管理員角色，接受所有請求
+    return False
 
 
 def _should_reject_market_request_for_shared_gateway(text: str) -> bool:
@@ -364,13 +362,11 @@ def _platform_config_key(platform: "Platform") -> str:
 
 
 def _load_gateway_config() -> dict:
-    """Load and parse ~/.hermes/config.yaml, returning {} on any error."""
+    """Load the effective Hermes config, including tier expansion."""
     try:
-        config_path = _hermes_home / 'config.yaml'
-        if config_path.exists():
-            import yaml
-            with open(config_path, 'r', encoding='utf-8') as f:
-                return yaml.safe_load(f) or {}
+        from hermes_cli.config import load_config
+
+        return load_config() or {}
     except Exception:
         logger.debug("Could not load gateway config from %s", _hermes_home / 'config.yaml')
     return {}
@@ -383,14 +379,17 @@ def _resolve_gateway_model(config: dict | None = None) -> str:
     back to the hardcoded default ("anthropic/claude-opus-4.6") which fails
     when the active provider is openai-codex.
     """
-    model = os.getenv("HERMES_MODEL") or os.getenv("LLM_MODEL") or "anthropic/claude-opus-4.6"
+    env_model = os.getenv("HERMES_MODEL") or os.getenv("LLM_MODEL") or ""
+    model = env_model or "anthropic/claude-opus-4.6"
     cfg = config if config is not None else _load_gateway_config()
     model_cfg = cfg.get("model", {})
     if isinstance(model_cfg, str):
-        model = model_cfg
+        config_model = model_cfg
     elif isinstance(model_cfg, dict):
-        model = model_cfg.get("default") or model_cfg.get("model") or model
-    return model
+        config_model = model_cfg.get("default") or model_cfg.get("model") or ""
+    else:
+        config_model = ""
+    return config_model or model
 
 
 def _resolve_hermes_bin() -> Optional[list[str]]:
@@ -2241,11 +2240,8 @@ class GatewayRunner:
             _hyg_base_url = None
             _hyg_api_key = None
             try:
-                _hyg_cfg_path = _hermes_home / "config.yaml"
-                if _hyg_cfg_path.exists():
-                    import yaml as _hyg_yaml
-                    with open(_hyg_cfg_path, encoding="utf-8") as _hyg_f:
-                        _hyg_data = _hyg_yaml.safe_load(_hyg_f) or {}
+                _hyg_data = _load_gateway_config()
+                if _hyg_data:
 
                     # Resolve model name (same logic as run_sync)
                     _model_cfg = _hyg_data.get("model", {})
@@ -2273,6 +2269,19 @@ class GatewayRunner:
                         _hyg_compression_enabled = str(
                             _comp_cfg.get("enabled", True)
                         ).lower() in ("true", "1", "yes")
+                        try:
+                            _agent_threshold_pct = float(
+                                _comp_cfg.get("threshold", 0.50)
+                            )
+                            # Keep gateway hygiene slightly later than the
+                            # agent's own compressor, but still aligned to the
+                            # configured threshold instead of a hard-coded 85%.
+                            _hyg_threshold_pct = min(
+                                0.85,
+                                max(0.70, _agent_threshold_pct + 0.05),
+                            )
+                        except Exception:
+                            pass
 
                 # Resolve provider/base_url from runtime if not in config
                 if not _hyg_provider or not _hyg_base_url:
