@@ -313,6 +313,73 @@ def deprecate_version(db: Any, version_id: str) -> None:
     logger.info("[CapabilityManager] Deprecated %s", version_id)
 
 
+def list_versions(
+    db: Any,
+    *,
+    status: Optional[str] = None,
+    capability_family: Optional[str] = None,
+    limit: int = 20,
+) -> list[dict]:
+    """Return capability_versions rows, newest first.
+
+    Filters by status (e.g. 'incubating') and/or capability_family when
+    given. No filter returns the most recent versions across the board.
+    """
+    clauses: list[str] = []
+    params: list[Any] = []
+    if status:
+        clauses.append("status = ?")
+        params.append(status)
+    if capability_family:
+        clauses.append("capability_family = ?")
+        params.append(capability_family)
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    params.append(limit)
+    rows = db._conn.execute(
+        f"""SELECT * FROM capability_versions{where}
+            ORDER BY created_at DESC LIMIT ?""",
+        tuple(params),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def start_experiment(db: Any, version_id: str) -> dict:
+    """Transition a capability_version from 'incubating' to 'experimental'.
+
+    Experimental is where the action_hint embedded in the version's
+    definition is meant to be actually tried — by operator tooling today,
+    by automation later. We bookkeep the transition through the existing
+    state machine (no schema change needed); the caller is responsible
+    for executing the underlying action or surfacing the action_hint to
+    the operator.
+
+    Returns the updated version dict, including its action_hint if the
+    source proposal carried one.
+    """
+    v = get_version(db, version_id)
+    if not v:
+        raise ValueError(f"Capability version not found: {version_id}")
+    if v["status"] != "incubating":
+        raise ValueError(
+            f"Version {version_id} is in status '{v['status']}' — "
+            "only 'incubating' can start an experiment"
+        )
+    transition_status(
+        db, version_id, "experimental",
+        reason="operator_started_experiment",
+    )
+    updated = get_version(db, version_id) or v
+    action_hint = {}
+    try:
+        definition = json.loads(updated.get("definition_json") or "{}")
+        source = definition.get("source") or {}
+        action_hint = source.get("action_hint") or {}
+    except Exception:
+        action_hint = {}
+    updated["action_hint"] = action_hint
+    return updated
+
+
 def get_capability_stats(db: Any) -> dict:
     """Get aggregate counts of capability versions by status."""
     try:

@@ -3378,6 +3378,68 @@ class GatewayRunner:
                 except Exception as e:
                     return f"Approve failed: {e}"
 
+            # /tasks versions [status] — list capability_versions
+            if args.startswith("versions"):
+                try:
+                    from brain.capability_manager import list_versions, get_capability_stats
+                    parts = args.split()[1:]
+                    status = parts[0] if parts else None
+                    rows = list_versions(db, status=status, limit=15)
+                    stats = get_capability_stats(db)
+                    lines = [
+                        f"**Capability Versions**  total={stats.get('total', 0)}  "
+                        f"(prop={stats.get('proposed', 0)}, "
+                        f"incub={stats.get('incubating', 0)}, "
+                        f"exper={stats.get('experimental', 0)}, "
+                        f"adopt={stats.get('adopted', 0)})",
+                        "",
+                    ]
+                    if not rows:
+                        filt = f" for status={status}" if status else ""
+                        lines.append(f"(no versions{filt})")
+                    else:
+                        for v in rows:
+                            lines.append(
+                                f"  `{v['id']}` v{v['version']} "
+                                f"[{v['status']:12s}] {v['capability_family']}"
+                            )
+                    lines.append("")
+                    lines.append("Use `/tasks experiment <version_id>` to advance incubating → experimental.")
+                    return "\n".join(lines)
+                except Exception as e:
+                    return f"Versions listing failed: {e}"
+
+            # /tasks experiment <version_id> — advance incubating → experimental
+            if args.startswith("experiment "):
+                try:
+                    import json as _json
+                    from brain.capability_manager import start_experiment
+                    vid = args[len("experiment"):].strip()
+                    if not vid:
+                        return "Usage: `/tasks experiment <version_id>`"
+                    updated = start_experiment(db, vid)
+                    action = updated.get("action_hint") or {}
+                    lines = [
+                        f"Version `{vid}` moved to `experimental`.",
+                        f"  family: {updated.get('capability_family')}",
+                        f"  source_proposal: {updated.get('source_proposal_id') or '-'}",
+                        "",
+                    ]
+                    if action:
+                        lines.append("**Action to execute** (operator):")
+                        lines.append(f"  kind: {action.get('kind', '?')}")
+                        for k, v in action.items():
+                            if k == "kind":
+                                continue
+                            lines.append(f"  {k}: {v}")
+                    else:
+                        lines.append("(no action_hint on source proposal — operator-guided only)")
+                    return "\n".join(lines)
+                except ValueError as ve:
+                    return f"Experiment refused: {ve}"
+                except Exception as e:
+                    return f"Experiment failed: {e}"
+
             # /tasks incubate <id> — bridge an approved proposal into
             # capability_versions (creates a version + transitions both)
             if args.startswith("incubate "):
