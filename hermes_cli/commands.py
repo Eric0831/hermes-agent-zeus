@@ -117,6 +117,10 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("plugins", "List installed plugins and their status",
                "Tools & Skills", cli_only=True),
 
+    # Brain (AgentEOS)
+    CommandDef("tasks", "Show brain-tracked tasks for this session", "Info",
+               gateway_only=True, args_hint="[task_id]"),
+
     # Info
     CommandDef("help", "Show available commands", "Info"),
     CommandDef("usage", "Show token usage for the current session", "Info"),
