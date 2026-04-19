@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""Preflight checks for gateway deploy / restart / rollback operations."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_DIR))
+
+from gateway.runtime_metadata import collect_runtime_metadata  # noqa: E402
+from gateway.status import get_running_pid, read_runtime_status  # noqa: E402
+
+
+REQUIRED_RUNTIME_KEYS = ("git_sha", "config_hash", "prompt_version", "model_name")
+REQUIRED_SCRIPTS = (
+    "gateway-up",
+    "gateway-stop",
+    "gateway-status",
+    "gateway-logs",
+    "gateway-healthcheck",
+    "gateway-monitor",
+)
+
+
+def _required_script_report() -> dict[str, object]:
+    scripts_dir = PROJECT_DIR / "scripts"
+    missing: list[str] = []
+    non_executable: list[str] = []
+    for name in REQUIRED_SCRIPTS:
+        path = scripts_dir / name
+        if not path.exists():
+            missing.append(name)
+            continue
+        if not path.is_file() or not path.stat().st_mode & 0o111:
+            non_executable.append(name)
+    return {
+        "missing": missing,
+        "non_executable": non_executable,
+        "ok": not missing and not non_executable,
+    }
+
+
+def classify_preflight(
+    state: dict[str, object] | None,
+    running_pid: int | None,
+    desired_metadata: dict[str, str],
+    scripts_report: dict[str, object],
+) -> tuple[str, int, list[str], dict[str, dict[str, str]]]:
+    issues: list[str] = []
+    mismatches: dict[str, dict[str, str]] = {}
+
+    for key in REQUIRED_RUNTIME_KEYS:
+        if desired_metadata.get(key) in {"", "unknown", "missing", "unreadable"}:
+            issues.append(f"invalid_desired_{key}")
+
+    if not scripts_report.get("ok", False):
+        for item in scripts_report.get("missing", []):
+            issues.append(f"missing_script:{item}")
+        for item in scripts_report.get("non_executable", []):
+            issues.append(f"non_executable_script:{item}")
+
+    runtime_metadata = {}
+    if state and isinstance(state.get("runtime_metadata"), dict):
+        runtime_metadata = state.get("runtime_metadata") or {}
+
+    if running_pid:
+        for key in REQUIRED_RUNTIME_KEYS:
+            desired = desired_metadata.get(key)
+            actual = str(runtime_metadata.get(key, "")).strip()
+            if actual and desired and actual != desired:
+                mismatches[key] = {"running": actual, "desired": desired}
+
+        if mismatches:
+            issues.extend([f"runtime_mismatch:{key}" for key in sorted(mismatches)])
+
+    gateway_state = str((state or {}).get("gateway_state", "unknown"))
+    if running_pid and gateway_state in {"startup_failed", "stopped"}:
+        issues.append(f"unexpected_gateway_state:{gateway_state}")
+
+    if issues:
+        return "failed", 2, issues, mismatches
+    if not running_pid:
+        return "ready", 0, ["gateway_not_running"], mismatches
+    return "ready", 0, [], mismatches
+
+
+def render_human_summary(payload: dict[str, object]) -> str:
+    desired = payload.get("desired_runtime_metadata", {}) or {}
+    running = payload.get("running_runtime_metadata", {}) or {}
+    mismatches = payload.get("mismatches", {}) or {}
+    issues = payload.get("issues", []) or []
+    lines = [
+        f"gateway preflight: {payload.get('status', 'unknown')}",
+        f"desired: git={desired.get('git_sha', 'unknown')} cfg={desired.get('config_hash', 'unknown')} prompt={desired.get('prompt_version', 'unknown')} model={desired.get('model_name', 'unknown')}",
+    ]
+    if payload.get("running"):
+        lines.append(
+            f"running: git={running.get('git_sha', 'unknown')} cfg={running.get('config_hash', 'unknown')} prompt={running.get('prompt_version', 'unknown')} model={running.get('model_name', 'unknown')}"
+        )
+    else:
+        lines.append("running: gateway_not_running")
+
+    if issues:
+        lines.append("issues:")
+        for item in issues:
+            lines.append(f"- {item}")
+
+    if mismatches:
+        lines.append("mismatches:")
+        for key, values in mismatches.items():
+            lines.append(f"- {key}: running={values.get('running', 'unknown')} desired={values.get('desired', 'unknown')}")
+
+    scripts = payload.get("scripts", {}) or {}
+    missing = scripts.get("missing", []) or []
+    non_executable = scripts.get("non_executable", []) or []
+    if missing:
+        lines.append(f"missing_scripts: {', '.join(missing)}")
+    if non_executable:
+        lines.append(f"non_executable_scripts: {', '.join(non_executable)}")
+
+    return "\n".join(lines)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--human", action="store_true", help="print a human-readable summary instead of JSON")
+    args = parser.parse_args()
+
+    desired_metadata = collect_runtime_metadata(project_root=PROJECT_DIR)
+    scripts_report = _required_script_report()
+    state = read_runtime_status() or {}
+    running_pid = get_running_pid()
+    status, exit_code, issues, mismatches = classify_preflight(
+        state,
+        running_pid,
+        desired_metadata,
+        scripts_report,
+    )
+
+    payload = {
+        "status": status,
+        "running": bool(running_pid),
+        "pid": running_pid,
+        "gateway_state": state.get("gateway_state", "unknown"),
+        "desired_runtime_metadata": desired_metadata,
+        "running_runtime_metadata": state.get("runtime_metadata", {}),
+        "mismatches": mismatches,
+        "issues": issues,
+        "scripts": scripts_report,
+    }
+    if args.human:
+        output = render_human_summary(payload)
+        stream = sys.stderr if exit_code else sys.stdout
+        print(output, file=stream)
+    else:
+        print(json.dumps(payload, ensure_ascii=False))
+    return exit_code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

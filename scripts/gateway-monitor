@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""Monitor Hermes gateway health and apply bounded auto-recovery."""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_DIR))
+
+from hermes_constants import get_hermes_home  # noqa: E402
+from hermes_cli.gateway import get_service_name  # noqa: E402
+from gateway.status import write_runtime_status  # noqa: E402
+
+
+STATE_PATH = get_hermes_home() / "gateway_monitor_state.json"
+AUTO_RESTART_CODES = {"timeout", "connection_reset", "provider_transient_error"}
+NO_RESTART_CODES = {
+    "rate_limited",
+    "provider_4xx_non_retryable",
+    "schema_validation_failed",
+    "local_validation_error",
+    "duplicate_request_suppressed",
+    "payload_too_large",
+    "context_length_exceeded",
+    "invalid_api_response",
+}
+WINDOW_SECONDS = 3600
+MAX_RESTARTS_PER_WINDOW = 3
+
+
+def load_state() -> dict:
+    try:
+        return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {"restart_timestamps": []}
+
+
+def save_state(state: dict) -> None:
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    STATE_PATH.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+
+
+def prune_restarts(now: float, timestamps: list[float]) -> list[float]:
+    return [ts for ts in timestamps if now - ts <= WINDOW_SECONDS]
+
+
+def decide_action(health_payload: dict, state: dict, now: float | None = None) -> dict:
+    now = now or time.time()
+    timestamps = prune_restarts(now, list(state.get("restart_timestamps", [])))
+    failure = health_payload.get("last_agent_failure", {}) or {}
+    error_code = failure.get("error_code")
+    health = health_payload.get("health", "failed")
+
+    if health == "healthy":
+        return {"action": "noop", "reason": "healthy", "restart_timestamps": timestamps}
+
+    if not health_payload.get("running", False):
+        if len(timestamps) >= MAX_RESTARTS_PER_WINDOW:
+            return {"action": "noop", "reason": "restart_budget_exhausted", "restart_timestamps": timestamps}
+        return {"action": "restart", "reason": "gateway_not_running", "restart_timestamps": timestamps}
+
+    if health == "failed":
+        if error_code in NO_RESTART_CODES:
+            return {"action": "noop", "reason": f"non_restartable:{error_code}", "restart_timestamps": timestamps}
+        if len(timestamps) >= MAX_RESTARTS_PER_WINDOW:
+            return {"action": "noop", "reason": "restart_budget_exhausted", "restart_timestamps": timestamps}
+        return {"action": "restart", "reason": error_code or "failed", "restart_timestamps": timestamps}
+
+    if health == "degraded":
+        if error_code in AUTO_RESTART_CODES and len(timestamps) < MAX_RESTARTS_PER_WINDOW:
+            return {"action": "restart", "reason": f"degraded:{error_code}", "restart_timestamps": timestamps}
+        return {"action": "noop", "reason": f"degraded:{error_code or 'unknown'}", "restart_timestamps": timestamps}
+
+    return {"action": "noop", "reason": "unknown_state", "restart_timestamps": timestamps}
+
+
+def run_healthcheck() -> tuple[int, dict]:
+    proc = subprocess.run(
+        [str(PROJECT_DIR / "scripts" / "gateway-healthcheck")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    try:
+        payload = json.loads(proc.stdout.strip() or "{}")
+    except json.JSONDecodeError:
+        payload = {
+            "health": "failed",
+            "running": False,
+            "gateway_state": "unknown",
+            "last_agent_failure": {"error_code": "healthcheck_parse_failed", "error": proc.stdout[-500:]},
+        }
+    return proc.returncode, payload
+
+
+def run_preflight() -> tuple[int, dict]:
+    proc = subprocess.run(
+        [str(PROJECT_DIR / "scripts" / "gateway-preflight")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    try:
+        payload = json.loads(proc.stdout.strip() or "{}")
+    except json.JSONDecodeError:
+        payload = {
+            "status": "failed",
+            "issues": ["preflight_parse_failed"],
+            "mismatches": {},
+            "scripts": {},
+        }
+    return proc.returncode, payload
+
+
+def restart_gateway() -> None:
+    subprocess.run(
+        ["systemctl", "--user", "restart", get_service_name()],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def main() -> int:
+    _, payload = run_healthcheck()
+    now = time.time()
+    state = load_state()
+    decision = decide_action(payload, state, now=now)
+    preflight = None
+    preflight_record = None
+
+    if decision["action"] == "restart":
+        preflight_exit_code, preflight = run_preflight()
+        preflight_record = {
+            "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+            "status": preflight.get("status", "failed"),
+            "exit_code": preflight_exit_code,
+            "issues": list(preflight.get("issues", []) or []),
+            "mismatches": dict(preflight.get("mismatches", {}) or {}),
+        }
+        if preflight_exit_code == 0:
+            restart_gateway()
+            restarts = list(decision["restart_timestamps"])
+            restarts.append(now)
+            state["restart_timestamps"] = restarts
+            save_state(state)
+        else:
+            decision = {
+                "action": "noop",
+                "reason": f"preflight_failed:{preflight.get('status', 'failed')}",
+                "restart_timestamps": decision["restart_timestamps"],
+            }
+            state["restart_timestamps"] = decision["restart_timestamps"]
+            save_state(state)
+    else:
+        state["restart_timestamps"] = decision["restart_timestamps"]
+        save_state(state)
+
+    monitor_record = {
+        "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+        "health": payload.get("health"),
+        "action": decision.get("action"),
+        "reason": decision.get("reason"),
+        "restart_count_window": len(decision.get("restart_timestamps", [])),
+        "restart_budget_window_seconds": WINDOW_SECONDS,
+        "restart_budget_max": MAX_RESTARTS_PER_WINDOW,
+    }
+    try:
+        if preflight_record is not None:
+            write_runtime_status(last_monitor_check=monitor_record, last_preflight_check=preflight_record)
+        else:
+            write_runtime_status(last_monitor_check=monitor_record)
+    except Exception:
+        pass
+
+    print(
+        json.dumps(
+            {
+                "health": payload.get("health"),
+                "gateway_state": payload.get("gateway_state"),
+                "last_agent_failure": payload.get("last_agent_failure", {}),
+                "decision": decision,
+                "preflight": preflight or {},
+                "last_preflight_check": preflight_record or {},
+                "last_monitor_check": monitor_record,
+                "service_name": get_service_name(),
+            },
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

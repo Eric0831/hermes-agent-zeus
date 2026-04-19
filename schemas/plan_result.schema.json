@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PlanResult",
+  "type": "object",
+  "properties": {
+    "task_id": {"type": "string"},
+    "summary": {"type": "string"},
+    "steps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "string"},
+          "description": {"type": "string"},
+          "status": {
+            "type": "string",
+            "enum": ["queued", "running", "waiting_model", "waiting_tool", "retrying", "completed", "failed", "aborted"]
+          }
+        },
+        "required": ["id", "description", "status"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["task_id", "summary", "steps"],
+  "additionalProperties": false
+}

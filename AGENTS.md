@@ -2,6 +2,17 @@
 
 Instructions for AI coding assistants and developers working on the hermes-agent codebase.
 
+## Stability V1 Rules
+
+- Maintain exactly one supported startup/runtime path for the managed gateway.
+- Do not introduce a second deploy, restart, or process-supervision flow.
+- Keep all stability work scoped to gateway/runtime, request resilience, schemas, task state, tests, and documentation.
+- Every new tool contract must include input schema validation; output schema support should be added when practical.
+- All fixed-format outputs must be defined through JSON Schema artifacts under `schemas/`.
+- Every milestone must update `IMPLEMENT.md` and `DOCUMENTATION.md`.
+- Every stability change must preserve or improve smoke coverage before widening scope.
+- Do not rewrite unrelated modules while working on stability v1.
+
 ## Development Environment
 
 ```bash

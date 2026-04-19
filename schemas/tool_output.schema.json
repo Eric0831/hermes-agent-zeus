@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ToolOutput",
+  "type": "object",
+  "properties": {
+    "tool_name": {"type": "string"},
+    "status": {"type": "string", "enum": ["ok", "error"]},
+    "result": {},
+    "error": {"type": "string"},
+    "request_id": {"type": "string"}
+  },
+  "required": ["status"],
+  "additionalProperties": false
+}

@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ToolSelection",
+  "type": "object",
+  "properties": {
+    "tool_name": {"type": "string"},
+    "reason": {"type": "string"},
+    "arguments": {"type": "object"}
+  },
+  "required": ["tool_name", "reason", "arguments"],
+  "additionalProperties": false
+}

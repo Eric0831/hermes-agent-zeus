@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "FinalResponse",
+  "type": "object",
+  "properties": {
+    "task_id": {"type": "string"},
+    "final_response": {"type": "string"},
+    "completed": {"type": "boolean"},
+    "error_code": {"type": "string"},
+    "request_id": {"type": "string"}
+  },
+  "required": ["final_response", "completed"],
+  "additionalProperties": false
+}

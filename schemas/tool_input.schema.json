@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ToolInput",
+  "type": "object",
+  "properties": {
+    "tool_name": {"type": "string"},
+    "request_id": {"type": "string"},
+    "task_id": {"type": "string"},
+    "arguments": {"type": "object"}
+  },
+  "required": ["tool_name", "arguments"],
+  "additionalProperties": false
+}

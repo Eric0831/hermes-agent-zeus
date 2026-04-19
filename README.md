@@ -80,6 +80,94 @@ Hermes has two entry points: start the terminal UI with `hermes`, or run the gat
 
 For the full command lists, see the [CLI guide](https://hermes-agent.nousresearch.com/docs/user-guide/cli) and the [Messaging Gateway guide](https://hermes-agent.nousresearch.com/docs/user-guide/messaging).
 
+## Gateway Operations
+
+Hermes now uses a single supported gateway runtime path:
+
+```bash
+python -m hermes_cli.main gateway run --replace
+```
+
+For day-to-day ops, use the shipped wrappers in [`scripts/`](scripts):
+
+```bash
+scripts/gateway-up          # start / replace the managed gateway
+scripts/gateway-stop        # stop the managed gateway
+scripts/gateway-status      # status + recent runtime health
+scripts/gateway-logs        # tail logs
+scripts/gateway-healthcheck # deep status / healthcheck
+scripts/gateway-preflight   # deploy / rollback fingerprint gate
+```
+
+Human-facing v1 stability wrappers are also available:
+
+```bash
+scripts/hermes_up.sh
+scripts/hermes_stop.sh
+scripts/hermes_restart.sh
+scripts/hermes_status.sh
+scripts/hermes_logs.sh
+scripts/hermes_smoke_test.sh
+```
+
+For the full operational contract and incident procedures, see the
+[Gateway Operations Runbook](docs/GATEWAY_OPERATIONS_RUNBOOK.md).
+For the current milestone scope and known limits, see
+[IMPLEMENT.md](IMPLEMENT.md) and [DOCUMENTATION.md](DOCUMENTATION.md).
+
+On every start, Hermes persists a runtime fingerprint with:
+- `git_sha`
+- `config_hash`
+- `prompt_version`
+- `model_name`
+
+This fingerprint is surfaced in gateway status so stale code, stale config, or
+prompt drift are visible immediately after restart.
+Gateway startup also performs a preflight repair pass that clears stale runtime
+state and orphaned scoped locks before the new process claims the service.
+
+### Restart / Debug / Rollback
+
+```bash
+scripts/gateway-stop
+git rev-parse --short HEAD
+scripts/gateway-up
+scripts/gateway-status
+scripts/gateway-logs
+```
+
+If a deploy regresses, roll back to a known commit and restart the same official
+entrypoint:
+
+```bash
+git checkout <known-good-sha>
+scripts/gateway-up
+scripts/gateway-status
+```
+
+The legacy `scripts/hermes-gateway` path remains only as a compatibility shim
+and delegates into the official CLI flow. Do not create alternate service
+wrappers or background launch commands outside the managed gateway path.
+
+`scripts/gateway-healthcheck` is the machine-readable probe:
+- exit `0`: healthy
+- exit `1`: gateway not running
+- exit `2`: hard failure (`provider_4xx_non_retryable`, `schema_validation_failed`, etc.)
+- exit `3`: degraded (`timeout`, `rate_limited`, `connection_reset`, etc.)
+
+`scripts/gateway-monitor` is the bounded auto-recovery loop:
+- restarts on `timeout`, `connection_reset`, `provider_transient_error`
+- runs `gateway-preflight` before any auto-restart
+- does not restart on `rate_limited` or hard config/schema failures
+- enforces a restart budget of 3 attempts per hour
+
+`scripts/gateway-preflight` is the deployment / rollback gate:
+- validates the desired runtime fingerprint from the current checkout
+- compares it to the running gateway fingerprint when a gateway is live
+- fails fast if a deploy would leave old code or old config in place
+- latest preflight result is surfaced in `gateway status` and `gateway-healthcheck`
+- `scripts/gateway-up` runs preflight in human-readable mode before restart
+
 ---
 
 ## Documentation

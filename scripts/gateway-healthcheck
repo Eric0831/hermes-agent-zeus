@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""Lightweight healthcheck for the managed Hermes gateway."""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_DIR))
+
+from gateway.status import get_running_pid, read_runtime_status  # noqa: E402
+
+
+HARD_FAILURE_CODES = {
+    "provider_4xx_non_retryable",
+    "schema_validation_failed",
+    "local_validation_error",
+}
+
+DEGRADED_FAILURE_CODES = {
+    "timeout",
+    "rate_limited",
+    "connection_reset",
+    "provider_transient_error",
+    "provider_request_failed",
+    "duplicate_request_suppressed",
+    "invalid_api_response",
+    "payload_too_large",
+    "context_length_exceeded",
+}
+
+
+def classify_health(state: dict, running_pid: int | None) -> tuple[str, int]:
+    if not running_pid:
+        return "failed", 1
+
+    gateway_state = state.get("gateway_state", "unknown")
+    if gateway_state in {"startup_failed", "stopped"}:
+        return "failed", 2
+
+    failure = state.get("last_agent_failure", {}) or {}
+    error_code = failure.get("error_code")
+    if error_code in HARD_FAILURE_CODES:
+        return "failed", 2
+    if error_code in DEGRADED_FAILURE_CODES:
+        return "degraded", 3
+
+    return "healthy", 0
+
+
+def main() -> int:
+    state = read_runtime_status() or {}
+    running_pid = get_running_pid()
+    health, exit_code = classify_health(state, running_pid)
+    payload = {
+        "running": bool(running_pid),
+        "pid": running_pid,
+        "health": health,
+        "gateway_state": state.get("gateway_state", "unknown"),
+        "exit_reason": state.get("exit_reason"),
+        "runtime_metadata": state.get("runtime_metadata", {}),
+        "last_agent_failure": state.get("last_agent_failure", {}),
+        "last_preflight_check": state.get("last_preflight_check", {}),
+    }
+    print(json.dumps(payload, ensure_ascii=False))
+    return exit_code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ErrorReport",
+  "type": "object",
+  "properties": {
+    "task_id": {"type": "string"},
+    "request_id": {"type": "string"},
+    "trace_id": {"type": "string"},
+    "error_code": {"type": "string"},
+    "error_type": {"type": "string"},
+    "message": {"type": "string"},
+    "retryable": {"type": "boolean"}
+  },
+  "required": ["error_code", "message", "retryable"],
+  "additionalProperties": false
+}
