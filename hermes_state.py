@@ -1564,12 +1564,42 @@ class SessionDB:
         return session_id
 
     def end_session(self, session_id: str, end_reason: str) -> None:
-        """Mark a session as ended."""
+        """Mark a session as ended and cancel any orphaned in-flight tasks.
+
+        Brain-tracked tasks left in running/planned/triaged when a session
+        rolls over (typically via compression) would otherwise stay in that
+        state forever, polluting world_state and pattern_mining. Cancel
+        them in the same write so the task_transitions log stays honest.
+        """
         def _do(conn):
+            now = time.time()
             conn.execute(
                 "UPDATE sessions SET ended_at = ?, end_reason = ? WHERE id = ?",
-                (time.time(), end_reason, session_id),
+                (now, end_reason, session_id),
             )
+            orphans = conn.execute(
+                """SELECT id, status FROM tasks
+                   WHERE session_id = ?
+                     AND status IN ('running','planned','triaged','verifying','blocked')""",
+                (session_id,),
+            ).fetchall()
+            cancel_reason = f"session_ended_during_execution (end_reason={end_reason})"
+            for row in orphans:
+                tid = row["id"] if hasattr(row, "keys") else row[0]
+                old = row["status"] if hasattr(row, "keys") else row[1]
+                conn.execute(
+                    """UPDATE tasks
+                       SET status = 'cancelled', updated_at = ?, completed_at = ?,
+                           failure_reason = ?
+                       WHERE id = ?""",
+                    (now, now, cancel_reason, tid),
+                )
+                conn.execute(
+                    """INSERT INTO task_transitions
+                       (task_id, from_state, to_state, reason, created_at)
+                       VALUES (?, ?, 'cancelled', ?, ?)""",
+                    (tid, old, cancel_reason, now),
+                )
         self._execute_write(_do)
 
     def reopen_session(self, session_id: str) -> None:
