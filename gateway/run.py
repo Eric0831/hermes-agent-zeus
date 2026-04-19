@@ -3378,6 +3378,24 @@ class GatewayRunner:
                 except Exception as e:
                     return f"Approve failed: {e}"
 
+            # /tasks incubate <id> — bridge an approved proposal into
+            # capability_versions (creates a version + transitions both)
+            if args.startswith("incubate "):
+                try:
+                    from brain.capability_manager import promote_from_proposal
+                    pid = args[len("incubate"):].strip()
+                    if not pid:
+                        return "Usage: `/tasks incubate <proposal_id>`"
+                    vid = promote_from_proposal(db, pid)
+                    return (
+                        f"Proposal `{pid}` promoted to capability version `{vid}` (incubating).\n"
+                        "Track via `/tasks capabilities` or drive it forward manually."
+                    )
+                except ValueError as ve:
+                    return f"Incubate refused: {ve}"
+                except Exception as e:
+                    return f"Incubate failed: {e}"
+
             # /tasks reject <id> [reason] — move a proposal to rejected
             if args.startswith("reject "):
                 try:

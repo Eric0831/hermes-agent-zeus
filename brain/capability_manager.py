@@ -153,6 +153,69 @@ def get_version(db: Any, version_id: str) -> Optional[dict]:
     return dict(row) if row else None
 
 
+def promote_from_proposal(db: Any, proposal_id: str) -> str:
+    """Bridge capability_proposals → capability_versions.
+
+    Takes an 'approved' capability_proposal, creates a capability_version
+    in 'incubating' status pre-linked via source_proposal_id, and moves
+    the proposal's own status to 'incubating' so both sides stay in sync.
+
+    The capability_family is derived as "{proposal_type}:{target_task_family}"
+    so each (type, family) pair gets its own version sequence. Existing
+    versions for the same family continue the sequence via _next_version.
+
+    Raises ValueError when the proposal is missing, in the wrong status,
+    or the transition fails.
+    """
+    from brain import evolution_architect
+
+    p = evolution_architect.get_proposal(db, proposal_id)
+    if not p:
+        raise ValueError(f"Proposal not found: {proposal_id}")
+    if p["status"] != "approved":
+        raise ValueError(
+            f"Proposal {proposal_id} is in status '{p['status']}' — "
+            "only 'approved' can be promoted"
+        )
+
+    try:
+        proposal_def = json.loads(p.get("proposal_json") or "{}")
+    except Exception:
+        proposal_def = {}
+
+    capability_family = f"{p['proposal_type']}:{p['target_task_family']}"
+    definition = {
+        "proposal_type": p["proposal_type"],
+        "target_task_family": p["target_task_family"],
+        "title": p.get("title", ""),
+        "expected_gain": p.get("expected_gain", 0.0),
+        "risk_score": p.get("risk_score", 0.3),
+        "source": proposal_def,
+    }
+
+    vid = create_version(
+        db,
+        capability_family=capability_family,
+        definition=definition,
+        source_proposal_id=proposal_id,
+    )
+    # Move the version forward from proposed to incubating (valid
+    # transition per ALLOWED_TRANSITIONS).
+    transition_status(db, vid, "incubating", reason="promoted_from_approved_proposal")
+
+    # Keep the proposal in sync so it no longer appears in the 'approved'
+    # backlog once it's actively being incubated as a version.
+    evolution_architect.update_proposal_status(
+        db, proposal_id, "incubating",
+        reason=f"promoted_to_capability_version:{vid}",
+    )
+    logger.info(
+        "[CapabilityManager] Promoted proposal %s -> version %s (family=%s)",
+        proposal_id, vid, capability_family,
+    )
+    return vid
+
+
 def get_active_version(db: Any, capability_family: str) -> Optional[dict]:
     """Get the currently adopted version for a capability family."""
     row = db._conn.execute(
