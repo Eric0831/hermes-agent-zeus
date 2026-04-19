@@ -95,7 +95,41 @@ def execute_run(
 
         logger.info("[MetaLearn] Run %s: %d tasks → %d findings",
                     rid, len(tasks), len(findings))
-        return {"run_id": rid, "tasks_analyzed": len(tasks), "findings": findings}
+
+        # Close the evolution loop: for every task family that surfaced a
+        # finding, ask evolution_architect to generate capability proposals.
+        # generate_proposals dedupes against existing active proposals so
+        # we don't flood the table when the same finding recurs.
+        proposals_created: list[str] = []
+        try:
+            from brain import evolution_architect
+            affected_families = {
+                f.get("task_family") for f in findings if f.get("task_family")
+            }
+            for fam in sorted(affected_families):
+                try:
+                    pids = evolution_architect.generate_proposals(
+                        db, fam, source_run_id=rid,
+                    )
+                    proposals_created.extend(pids)
+                except Exception as _pe:
+                    logger.debug(
+                        "[MetaLearn] evolution_architect failed for '%s': %s",
+                        fam, _pe,
+                    )
+        except ImportError:
+            pass  # evolution_architect optional
+
+        if proposals_created:
+            logger.info("[MetaLearn] Run %s → %d new capability proposals",
+                        rid, len(proposals_created))
+
+        return {
+            "run_id": rid,
+            "tasks_analyzed": len(tasks),
+            "findings": findings,
+            "proposals_created": proposals_created,
+        }
 
     except Exception as e:
         logger.error("[MetaLearn] Run %s failed: %s", rid, e)

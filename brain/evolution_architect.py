@@ -84,10 +84,32 @@ def generate_proposals(
         )
         return []
 
-    # Persist proposals
+    # Persist proposals — dedupe against existing active proposals so
+    # repeated runs don't flood the table with identical entries. An
+    # existing (type, family, title) in any non-terminal state is
+    # considered covered; rejected / deprecated ones can re-emerge.
+    _ACTIVE_PROPOSAL_STATES = ("proposed", "approved", "incubating", "active")
+    existing_rows = db._conn.execute(
+        f"""SELECT proposal_type, title FROM capability_proposals
+            WHERE target_task_family = ?
+              AND status IN ({','.join('?' * len(_ACTIVE_PROPOSAL_STATES))})""",
+        (task_family, *_ACTIVE_PROPOSAL_STATES),
+    ).fetchall()
+    existing_keys: set[tuple[str, str]] = {
+        (r["proposal_type"] if hasattr(r, "keys") else r[0],
+         r["title"] if hasattr(r, "keys") else r[1])
+        for r in existing_rows
+    }
+
     now = time.time()
     ids: list[str] = []
+    skipped = 0
     for p in proposals:
+        key = (p["proposal_type"], p["title"])
+        if key in existing_keys:
+            skipped += 1
+            continue
+        existing_keys.add(key)  # dedupe within this batch too
         pid = _proposal_id()
         ids.append(pid)
 
@@ -115,9 +137,14 @@ def generate_proposals(
 
         db._execute_write(_do)
 
+    if skipped:
+        logger.debug(
+            "[EvolutionArchitect] Deduped %d already-active proposals for '%s'",
+            skipped, task_family,
+        )
     logger.info(
-        "[EvolutionArchitect] Generated %d proposals for family '%s'",
-        len(ids), task_family,
+        "[EvolutionArchitect] Generated %d proposals for family '%s' (skipped %d duplicates)",
+        len(ids), task_family, skipped,
     )
     return ids
 
