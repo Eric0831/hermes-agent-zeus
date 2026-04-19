@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Hermes Federation Audit Report every 6 hours
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=6h
+Persistent=true
+RandomizedDelaySec=2m
+Unit=hermes-audit-report.service
+
+[Install]
+WantedBy=timers.target
