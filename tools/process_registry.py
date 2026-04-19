@@ -45,6 +45,7 @@ from tools.environments.local import _find_shell, _sanitize_subprocess_env
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from agent.task_state import transition_task_state
 from hermes_cli.config import get_hermes_home
 
 logger = logging.getLogger(__name__)
@@ -81,6 +82,11 @@ class ProcessSession:
     watcher_chat_id: str = ""
     watcher_thread_id: str = ""
     watcher_interval: int = 0                   # 0 = no watcher configured
+    job_state: str = "queued"                   # queued/running/waiting_model/waiting_tool/retrying/completed/failed/aborted
+    retry_count: int = 0
+    request_id: str = ""
+    tool_name: str = "terminal"
+    state_history: List[Dict[str, Any]] = field(default_factory=list)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (when use_pty=True)
@@ -103,6 +109,14 @@ class ProcessRegistry:
         "cannot set terminal process group",
         "tcsetattr: Inappropriate ioctl for device",
     )
+    _WAITING_TOOL_PATTERNS = (
+        "enter your choice",
+        "continue? [y/n]",
+        "password:",
+        "press enter to continue",
+        "waiting for input",
+        "confirm [y/n]",
+    )
 
     def __init__(self):
         self._running: Dict[str, ProcessSession] = {}
@@ -111,6 +125,31 @@ class ProcessRegistry:
 
         # Side-channel for check_interval watchers (gateway reads after agent run)
         self.pending_watchers: List[Dict[str, Any]] = []
+
+    @staticmethod
+    def _record_transition(
+        session: ProcessSession,
+        next_state: str,
+        reason: str,
+        *,
+        request_id: str = "",
+        tool_name: str = "",
+        attempt_no: Optional[int] = None,
+    ) -> None:
+        current_state = session.job_state or "queued"
+        if current_state == next_state:
+            return
+        transition = transition_task_state(
+            task_id=session.task_id or session.id,
+            current_state=current_state,
+            next_state=next_state,
+            reason=reason,
+            request_id=request_id or session.request_id,
+            tool_name=tool_name or session.tool_name,
+            attempt_no=session.retry_count if attempt_no is None else attempt_no,
+        )
+        session.job_state = next_state
+        session.state_history.append(transition.as_dict())
 
     @staticmethod
     def _clean_shell_noise(text: str) -> str:
@@ -148,7 +187,9 @@ class ProcessRegistry:
             session_key=session_key,
             cwd=cwd or os.getcwd(),
             started_at=time.time(),
+            job_state="queued",
         )
+        self._record_transition(session, "running", "local_spawn_started")
 
         if use_pty:
             # Try PTY mode for interactive CLI tools
@@ -216,7 +257,6 @@ class ProcessRegistry:
 
         session.process = proc
         session.pid = proc.pid
-
         # Start output reader thread
         reader = threading.Thread(
             target=self._reader_loop,
@@ -262,7 +302,9 @@ class ProcessRegistry:
             cwd=cwd,
             started_at=time.time(),
             env_ref=env,
+            job_state="queued",
         )
+        self._record_transition(session, "waiting_model", "sandbox_spawn_requested")
 
         # Run the command in the sandbox with output capture
         log_path = f"/tmp/hermes_bg_{session.id}.log"
@@ -281,10 +323,12 @@ class ProcessRegistry:
                 line = line.strip()
                 if line.isdigit():
                     session.pid = int(line)
+                    self._record_transition(session, "running", "sandbox_spawn_started")
                     break
         except Exception as e:
             session.exited = True
             session.exit_code = -1
+            self._record_transition(session, "failed", f"sandbox_spawn_failed:{type(e).__name__}")
             session.output_buffer = f"Failed to start: {e}"
 
         if not session.exited:
@@ -332,6 +376,11 @@ class ProcessRegistry:
             logger.debug("Process wait timed out or failed: %s", e)
         session.exited = True
         session.exit_code = session.process.returncode
+        self._record_transition(
+            session,
+            "completed" if session.exit_code == 0 else "failed",
+            "process_exited",
+        )
         self._move_to_finished(session)
 
     def _env_poller_loop(
@@ -368,6 +417,11 @@ class ProcessRegistry:
                     except (ValueError, IndexError):
                         session.exit_code = -1
                     session.exited = True
+                    self._record_transition(
+                        session,
+                        "completed" if session.exit_code == 0 else "failed",
+                        "sandbox_process_exited",
+                    )
                     self._move_to_finished(session)
                     return
 
@@ -375,6 +429,7 @@ class ProcessRegistry:
                 # Environment might be gone (sandbox reaped, etc.)
                 session.exited = True
                 session.exit_code = -1
+                self._record_transition(session, "failed", "sandbox_poller_failed")
                 self._move_to_finished(session)
                 return
 
@@ -406,6 +461,11 @@ class ProcessRegistry:
             logger.debug("PTY wait timed out or failed: %s", e)
         session.exited = True
         session.exit_code = pty.exitstatus if hasattr(pty, 'exitstatus') else -1
+        self._record_transition(
+            session,
+            "completed" if session.exit_code == 0 else "failed",
+            "pty_process_exited",
+        )
         self._move_to_finished(session)
 
     def _move_to_finished(self, session: ProcessSession):
@@ -414,6 +474,19 @@ class ProcessRegistry:
             self._running.pop(session.id, None)
             self._finished[session.id] = session
         self._write_checkpoint()
+
+    def _job_state(self, session: ProcessSession) -> str:
+        if session.exited:
+            return "completed" if session.exit_code == 0 else "failed"
+        if session.job_state == "retrying":
+            return "retrying"
+        with session._lock:
+            preview = (session.output_buffer or "")[-500:].lower()
+        if any(pattern in preview for pattern in self._WAITING_TOOL_PATTERNS):
+            if session.job_state not in {"waiting_tool", "completed", "failed", "aborted"}:
+                self._record_transition(session, "waiting_tool", "interactive_prompt_detected")
+            return "waiting_tool"
+        return session.job_state or "running"
 
     # ----- Query Methods -----
 
@@ -437,9 +510,11 @@ class ProcessRegistry:
             "session_id": session.id,
             "command": session.command,
             "status": "exited" if session.exited else "running",
+            "job_state": self._job_state(session),
             "pid": session.pid,
             "uptime_seconds": int(time.time() - session.started_at),
             "output_preview": output_preview,
+            "state_history": list(session.state_history[-10:]),
         }
         if session.exited:
             result["exit_code"] = session.exit_code
@@ -471,9 +546,11 @@ class ProcessRegistry:
         return {
             "session_id": session.id,
             "status": "exited" if session.exited else "running",
+            "job_state": self._job_state(session),
             "output": "\n".join(selected),
             "total_lines": total_lines,
             "showing": f"{len(selected)} lines",
+            "state_history": list(session.state_history[-10:]),
         }
 
     def wait(self, session_id: str, timeout: int = None) -> dict:
@@ -515,8 +592,10 @@ class ProcessRegistry:
             if session.exited:
                 result = {
                     "status": "exited",
+                    "job_state": self._job_state(session),
                     "exit_code": session.exit_code,
                     "output": strip_ansi(session.output_buffer[-2000:]),
+                    "state_history": list(session.state_history[-10:]),
                 }
                 if timeout_note:
                     result["timeout_note"] = timeout_note
@@ -525,8 +604,10 @@ class ProcessRegistry:
             if _interrupt_event.is_set():
                 result = {
                     "status": "interrupted",
+                    "job_state": self._job_state(session),
                     "output": strip_ansi(session.output_buffer[-1000:]),
                     "note": "User sent a new message -- wait interrupted",
+                    "state_history": list(session.state_history[-10:]),
                 }
                 if timeout_note:
                     result["timeout_note"] = timeout_note
@@ -536,7 +617,9 @@ class ProcessRegistry:
 
         result = {
             "status": "timeout",
+            "job_state": self._job_state(session),
             "output": strip_ansi(session.output_buffer[-1000:]),
+            "state_history": list(session.state_history[-10:]),
         }
         if timeout_note:
             result["timeout_note"] = timeout_note
@@ -579,6 +662,7 @@ class ProcessRegistry:
                 session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
             session.exited = True
             session.exit_code = -15  # SIGTERM
+            self._record_transition(session, "aborted", "killed_by_operator")
             self._move_to_finished(session)
             self._write_checkpoint()
             return {"status": "killed", "session_id": session.id}
@@ -598,6 +682,7 @@ class ProcessRegistry:
             try:
                 pty_data = data.encode("utf-8") if isinstance(data, str) else data
                 session._pty.write(pty_data)
+                self._record_transition(session, "running", "stdin_written")
                 return {"status": "ok", "bytes_written": len(data)}
             except Exception as e:
                 return {"status": "error", "error": str(e)}
@@ -608,6 +693,7 @@ class ProcessRegistry:
         try:
             session.process.stdin.write(data)
             session.process.stdin.flush()
+            self._record_transition(session, "running", "stdin_written")
             return {"status": "ok", "bytes_written": len(data)}
         except Exception as e:
             return {"status": "error", "error": str(e)}
@@ -634,7 +720,9 @@ class ProcessRegistry:
                 "started_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(s.started_at)),
                 "uptime_seconds": int(time.time() - s.started_at),
                 "status": "exited" if s.exited else "running",
+                "job_state": self._job_state(s),
                 "output_preview": s.output_buffer[-200:] if s.output_buffer else "",
+                "state_history": list(s.state_history[-10:]),
             }
             if s.exited:
                 entry["exit_code"] = s.exit_code
@@ -721,6 +809,11 @@ class ProcessRegistry:
                             "watcher_chat_id": s.watcher_chat_id,
                             "watcher_thread_id": s.watcher_thread_id,
                             "watcher_interval": s.watcher_interval,
+                            "job_state": self._job_state(s),
+                            "retry_count": s.retry_count,
+                            "request_id": s.request_id,
+                            "tool_name": s.tool_name,
+                            "state_history": list(s.state_history[-20:]),
                         })
             
             # Atomic write to avoid corruption on crash
@@ -771,6 +864,11 @@ class ProcessRegistry:
                     watcher_chat_id=entry.get("watcher_chat_id", ""),
                     watcher_thread_id=entry.get("watcher_thread_id", ""),
                     watcher_interval=entry.get("watcher_interval", 0),
+                    job_state="retrying" if entry.get("job_state") == "retrying" else "running",
+                    retry_count=int(entry.get("retry_count", 0) or 0),
+                    request_id=entry.get("request_id", ""),
+                    tool_name=entry.get("tool_name", "terminal"),
+                    state_history=list(entry.get("state_history", []) or []),
                 )
                 with self._lock:
                     self._running[session.id] = session

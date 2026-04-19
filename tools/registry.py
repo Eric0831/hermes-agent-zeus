@@ -16,9 +16,88 @@ Import chain (circular-import safe):
 
 import json
 import logging
-from typing import Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
+
+
+class ToolSchemaValidationError(ValueError):
+    """Raised when model-supplied tool arguments fail schema validation."""
+
+    def __init__(self, details: list[str]):
+        super().__init__("tool schema validation failed")
+        self.details = details
+
+
+def _json_type_name(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int) and not isinstance(value, bool):
+        return "integer"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return type(value).__name__
+
+
+def _matches_type(expected: str, value: Any) -> bool:
+    actual = _json_type_name(value)
+    if expected == "number":
+        return actual in {"integer", "number"}
+    return actual == expected
+
+
+def _validate_schema(value: Any, schema: dict[str, Any], path: str = "$") -> list[str]:
+    if not schema:
+        return []
+    errors: list[str] = []
+    expected_type = schema.get("type")
+    if expected_type and not _matches_type(expected_type, value):
+        return [f"{path}: expected {expected_type}, got {_json_type_name(value)}"]
+
+    if expected_type == "object":
+        properties = schema.get("properties") or {}
+        required = schema.get("required") or []
+        additional = schema.get("additionalProperties", True)
+        if not isinstance(value, dict):
+            return [f"{path}: expected object, got {_json_type_name(value)}"]
+        for key in required:
+            if key not in value:
+                errors.append(f"{path}.{key}: missing required field")
+        if additional is False:
+            allowed = set(properties.keys())
+            for key in value.keys():
+                if key not in allowed:
+                    errors.append(f"{path}.{key}: unexpected field")
+        for key, child_schema in properties.items():
+            if key in value:
+                errors.extend(_validate_schema(value[key], child_schema, f"{path}.{key}"))
+        return errors
+
+    if expected_type == "array":
+        if not isinstance(value, list):
+            return [f"{path}: expected array, got {_json_type_name(value)}"]
+        item_schema = schema.get("items")
+        if item_schema:
+            for idx, item in enumerate(value):
+                errors.extend(_validate_schema(item, item_schema, f"{path}[{idx}]"))
+        return errors
+
+    if "enum" in schema and value not in schema["enum"]:
+        errors.append(f"{path}: expected one of {schema['enum']}, got {value!r}")
+
+    minimum = schema.get("minimum")
+    if minimum is not None and isinstance(value, (int, float)) and value < minimum:
+        errors.append(f"{path}: expected >= {minimum}, got {value}")
+
+    return errors
 
 
 class ToolEntry:
@@ -27,10 +106,12 @@ class ToolEntry:
     __slots__ = (
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
+        "output_schema", "timeout_seconds", "error_map", "side_effect",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
-                 requires_env, is_async, description, emoji):
+                 requires_env, is_async, description, emoji,
+                 output_schema, timeout_seconds, error_map, side_effect):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -40,6 +121,10 @@ class ToolEntry:
         self.is_async = is_async
         self.description = description
         self.emoji = emoji
+        self.output_schema = output_schema or {}
+        self.timeout_seconds = timeout_seconds
+        self.error_map = error_map or {}
+        self.side_effect = side_effect or "read_only"
 
 
 class ToolRegistry:
@@ -64,6 +149,10 @@ class ToolRegistry:
         is_async: bool = False,
         description: str = "",
         emoji: str = "",
+        output_schema: dict | None = None,
+        timeout_seconds: int | None = None,
+        error_map: dict | None = None,
+        side_effect: str = "read_only",
     ):
         """Register a tool.  Called at module-import time by each tool file."""
         existing = self._tools.get(name)
@@ -83,6 +172,10 @@ class ToolRegistry:
             is_async=is_async,
             description=description or schema.get("description", ""),
             emoji=emoji,
+            output_schema=output_schema or {},
+            timeout_seconds=timeout_seconds,
+            error_map=error_map or {},
+            side_effect=side_effect,
         )
         if check_fn and toolset not in self._toolset_checks:
             self._toolset_checks[toolset] = check_fn
@@ -133,10 +226,47 @@ class ToolRegistry:
         if not entry:
             return json.dumps({"error": f"Unknown tool: {name}"})
         try:
+            parameters_schema = (entry.schema or {}).get("parameters") or {}
+            errors = _validate_schema(args, parameters_schema)
+            if errors:
+                raise ToolSchemaValidationError(errors)
             if entry.is_async:
                 from model_tools import _run_async
-                return _run_async(entry.handler(args, **kwargs))
-            return entry.handler(args, **kwargs)
+                result = _run_async(entry.handler(args, **kwargs))
+            else:
+                result = entry.handler(args, **kwargs)
+
+            try:
+                parsed = json.loads(result)
+            except Exception:
+                return json.dumps(
+                    {
+                        "error": "tool_output_not_json",
+                        "tool": name,
+                    },
+                    ensure_ascii=False,
+                )
+
+            output_errors = _validate_schema(parsed, entry.output_schema or {})
+            if output_errors:
+                return json.dumps(
+                    {
+                        "error": "tool_output_validation_failed",
+                        "tool": name,
+                        "details": output_errors,
+                    },
+                    ensure_ascii=False,
+                )
+            return json.dumps(parsed, ensure_ascii=False)
+        except ToolSchemaValidationError as exc:
+            return json.dumps(
+                {
+                    "error": "schema_validation_failed",
+                    "tool": name,
+                    "details": exc.details,
+                },
+                ensure_ascii=False,
+            )
         except Exception as e:
             logger.exception("Tool %s dispatch error: %s", name, e)
             return json.dumps({"error": f"Tool execution failed: {type(e).__name__}: {e}"})
@@ -162,6 +292,20 @@ class ToolRegistry:
     def get_tool_to_toolset_map(self) -> Dict[str, str]:
         """Return ``{tool_name: toolset_name}`` for every registered tool."""
         return {name: e.toolset for name, e in self._tools.items()}
+
+    def get_tool_runtime_contract(self, name: str) -> Optional[dict[str, Any]]:
+        entry = self._tools.get(name)
+        if not entry:
+            return None
+        return {
+            "name": entry.name,
+            "toolset": entry.toolset,
+            "timeout_seconds": entry.timeout_seconds,
+            "side_effect": entry.side_effect,
+            "error_map": entry.error_map,
+            "has_input_schema": bool((entry.schema or {}).get("parameters")),
+            "has_output_schema": bool(entry.output_schema),
+        }
 
     def is_toolset_available(self, toolset: str) -> bool:
         """Check if a toolset's requirements are met.
