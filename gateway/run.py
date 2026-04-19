@@ -392,6 +392,51 @@ def _resolve_gateway_model(config: dict | None = None) -> str:
     return config_model or model
 
 
+def _capture_tool_evidence(messages: list, task_id: str, db: Any) -> None:
+    """Walk an agent result's messages and record tool outputs as evidence.
+
+    Most providers — including local vLLM — don't populate `name` on the
+    tool response message, so we build a tool_call_id -> tool_name map
+    from the preceding assistant messages first. Without this the
+    evidence_records.tool_name column accumulates 'unknown' for ~100%
+    of tool calls (observed: 15199/15202 rows before this fix).
+
+    Failures are non-fatal; callers must not depend on evidence being
+    captured for correctness.
+    """
+    from brain import evidence as brain_evidence  # local import — runtime only
+
+    tool_name_by_call_id: dict[str, str] = {}
+    for m in messages or []:
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            for tc in m.get("tool_calls") or []:
+                tc_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+                fn = tc.get("function") if isinstance(tc, dict) else getattr(tc, "function", None)
+                name = fn.get("name") if isinstance(fn, dict) else getattr(fn, "name", None) if fn else None
+                if tc_id and name:
+                    tool_name_by_call_id[tc_id] = name
+
+    for m in messages or []:
+        if m.get("role") not in ("tool", "function") or not m.get("content"):
+            continue
+        try:
+            resolved = (
+                m.get("tool_name")
+                or m.get("name")
+                or tool_name_by_call_id.get(m.get("tool_call_id", ""), "")
+                or "unknown"
+            )
+            brain_evidence.capture_from_tool_result(
+                task_id,
+                tool_name=resolved,
+                tool_call_id=m.get("tool_call_id", ""),
+                output=m.get("content", ""),
+                db=db,
+            )
+        except Exception as exc:
+            logger.debug("Evidence capture failed (non-fatal): %s", exc)
+
+
 def _resolve_hermes_bin() -> Optional[list[str]]:
     """Resolve the Hermes update command as argv parts.
 
@@ -3574,20 +3619,8 @@ class GatewayRunner:
                 event_message_id=getattr(event, 'message_id', None),
             )
 
-            # Capture evidence
-            from brain import evidence as brain_evidence
-            for msg in agent_result.get("messages", []):
-                if msg.get("role") in ("tool", "function") and msg.get("content"):
-                    try:
-                        brain_evidence.capture_from_tool_result(
-                            task_id,
-                            tool_name=msg.get("tool_name") or msg.get("name", "unknown"),
-                            tool_call_id=msg.get("tool_call_id", ""),
-                            output=msg.get("content", ""),
-                            db=db,
-                        )
-                    except Exception:
-                        pass
+            # Capture evidence (shared helper resolves tool_name via tool_call_id)
+            _capture_tool_evidence(agent_result.get("messages", []), task_id, db)
 
             final_response = agent_result.get("final_response", "")
             if final_response:
@@ -5695,19 +5728,9 @@ class GatewayRunner:
             event_message_id=getattr(event, 'message_id', None),
         )
 
-        # 5. Capture evidence from tool calls in the result
-        for msg in agent_result.get("messages", []):
-            if msg.get("role") in ("tool", "function") and msg.get("content"):
-                try:
-                    brain_evidence.capture_from_tool_result(
-                        task_id,
-                        tool_name=msg.get("tool_name") or msg.get("name", "unknown"),
-                        tool_call_id=msg.get("tool_call_id", ""),
-                        output=msg.get("content", ""),
-                        db=db,
-                    )
-                except Exception as _ev_exc:
-                    logger.debug("Evidence capture failed (non-fatal): %s", _ev_exc)
+        # 5. Capture evidence from tool calls (shared helper resolves
+        # tool_name via tool_call_id when the provider omits `name`).
+        _capture_tool_evidence(agent_result.get("messages", []), task_id, db)
 
         final_response = agent_result.get("final_response", "")
         if final_response:
@@ -5762,19 +5785,8 @@ class GatewayRunner:
                     event_message_id=getattr(event, 'message_id', None),
                 )
 
-                # Capture retry evidence
-                for msg in retry_result.get("messages", []):
-                    if msg.get("role") in ("tool", "function") and msg.get("content"):
-                        try:
-                            brain_evidence.capture_from_tool_result(
-                                task_id,
-                                tool_name=msg.get("tool_name") or msg.get("name", "unknown"),
-                                tool_call_id=msg.get("tool_call_id", ""),
-                                output=msg.get("content", ""),
-                                db=db,
-                            )
-                        except Exception:
-                            pass
+                # Capture retry evidence (shared helper)
+                _capture_tool_evidence(retry_result.get("messages", []), task_id, db)
 
                 retry_response = retry_result.get("final_response", "")
                 if retry_response:
