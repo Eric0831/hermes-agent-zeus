@@ -287,6 +287,20 @@ def _analyze_failure_patterns(
                 "total_reflections": total,
                 "rate": insufficient / total,
             },
+            "suggestion": (
+                f"{insufficient}/{total} reflections cite 'insufficient_evidence' "
+                f"({insufficient / total:.0%}). Review the Planner prompt for "
+                f"'{task_family}' tasks and add explicit tool-usage criteria "
+                f"(e.g. 'call session_search at least once', 'summarize any "
+                f"web_extract result before concluding'). Also consider tightening "
+                f"the Verifier's heuristic for this family to require specific "
+                f"evidence types."
+            ),
+            "action_hint": {
+                "kind": "update_planner_prompt",
+                "task_family": task_family,
+                "focus": "mandatory_evidence_criteria",
+            },
             "expected_gain": min(0.3 + (insufficient / total) * 0.4, 0.8),
             "risk_score": 0.2,
         })
@@ -302,6 +316,20 @@ def _analyze_failure_patterns(
                 "occurrences": mismatch,
                 "total_reflections": total,
                 "rate": mismatch / total,
+            },
+            "suggestion": (
+                f"{mismatch}/{total} reflections cite 'planning_mismatch' "
+                f"({mismatch / total:.0%}). The Planner's subtask graph for "
+                f"'{task_family}' is drifting from actual execution. Capture the "
+                f"5 most recent successful '{task_family}' tasks, extract their "
+                f"real subtask sequences, and inject them into the Planner's "
+                f"few-shot examples for this family. Cap subtasks at 6 to reduce "
+                f"over-decomposition."
+            ),
+            "action_hint": {
+                "kind": "update_planner_examples",
+                "task_family": task_family,
+                "source": "successful_tasks_last_5",
             },
             "expected_gain": min(0.2 + (mismatch / total) * 0.5, 0.7),
             "risk_score": 0.3,
@@ -329,10 +357,25 @@ def _analyze_verification_gaps(
 
         if finding_type == "low_verification_rate":
             detail = data.get("detail", {})
+            rate = detail.get("rate", 0)
             proposals.append({
                 "proposal_type": "new_verifier_pattern",
                 "title": f"Address low verification pass rate for '{task_family}'",
                 "detail": detail,
+                "suggestion": (
+                    f"Verification passes only {rate:.0%} of the time on "
+                    f"'{task_family}'. Two likely causes: (1) Planner criteria are "
+                    f"too ambitious relative to actual evidence captured, or "
+                    f"(2) Verifier heuristics mis-classify evidence. Start by "
+                    f"enabling verifier.verify_with_llm=true for this family in "
+                    f"config.yaml for 3 days, then inspect the LLM failures and "
+                    f"backport stricter or looser heuristic rules as needed."
+                ),
+                "action_hint": {
+                    "kind": "toggle_verifier_llm",
+                    "task_family": task_family,
+                    "duration_days": 3,
+                },
                 "expected_gain": 0.4,
                 "risk_score": 0.25,
             })
@@ -342,6 +385,18 @@ def _analyze_verification_gaps(
                 "proposal_type": "new_verifier_pattern",
                 "title": f"Tighten verification criteria for '{task_family}'",
                 "detail": data.get("detail", {}),
+                "suggestion": (
+                    f"Verification passes >95% on '{task_family}' — the heuristic "
+                    f"is likely pattern-matching keywords instead of actual work. "
+                    f"Add at least one criterion type that demands concrete "
+                    f"evidence (a specific tool_call, a file diff, a numeric "
+                    f"result) and re-run meta_learning after 50 fresh tasks."
+                ),
+                "action_hint": {
+                    "kind": "add_verifier_criterion_type",
+                    "task_family": task_family,
+                    "requires": "concrete_evidence_artifact",
+                },
                 "expected_gain": 0.2,
                 "risk_score": 0.15,
             })
@@ -371,6 +426,20 @@ def _analyze_skill_gaps(
                 "reason": "No active skills exist for an underperforming task family",
                 "findings_count": len(underperforming),
             },
+            "suggestion": (
+                f"'{task_family}' is under-performing with zero active skills in "
+                f"skill_registry. Pick the 3 most successful completed "
+                f"'{task_family}' tasks from state.db, extract the common tool "
+                f"sequence (session_search → X → Y → response), and register it "
+                f"as a candidate skill named '{task_family}_default_flow'. "
+                f"Promote to active after 5 successful invocations."
+            ),
+            "action_hint": {
+                "kind": "extract_skill",
+                "task_family": task_family,
+                "source": "top_3_successful_tasks",
+                "skill_name": f"{task_family}_default_flow",
+            },
             "expected_gain": 0.5,
             "risk_score": 0.3,
         })
@@ -387,6 +456,18 @@ def _analyze_skill_gaps(
             "detail": {
                 "reason": "Tools used by this family have low success correlation",
                 "findings_count": len(low_tool),
+            },
+            "suggestion": (
+                f"One or more tools used by '{task_family}' show <50% success "
+                f"correlation. For each flagged tool in the detail payload, add "
+                f"a fallback in the relevant brain.policy rule (retry with "
+                f"alternative tool on failure) and document the preferred "
+                f"alternative in a skill named '{task_family}_tool_fallbacks'."
+            ),
+            "action_hint": {
+                "kind": "add_tool_fallback",
+                "task_family": task_family,
+                "skill_name": f"{task_family}_tool_fallbacks",
             },
             "expected_gain": 0.35,
             "risk_score": 0.25,
@@ -417,6 +498,19 @@ def _analyze_routing_issues(
                 "reason": "High retry rate indicates suboptimal routing or priority",
                 "findings_count": len(high_retry),
             },
+            "suggestion": (
+                f"'{task_family}' retries >30% of tasks. Plans are either "
+                f"under-specified or the Verifier is too strict on the first "
+                f"pass. Short-term: bump brain.max_retries from 2 → 3 only for "
+                f"this family. Medium-term: add a 'clarification subtask' to the "
+                f"Planner template so the first pass gathers requirements "
+                f"before committing to execution."
+            ),
+            "action_hint": {
+                "kind": "increase_retry_budget",
+                "task_family": task_family,
+                "new_max_retries": 3,
+            },
             "expected_gain": 0.3,
             "risk_score": 0.2,
         })
@@ -435,6 +529,19 @@ def _analyze_routing_issues(
                     "timeout_count": timeout_count,
                     "total_reflections": len(reflections),
                     "rate": timeout_count / len(reflections),
+                },
+                "suggestion": (
+                    f"{timeout_count}/{len(reflections)} reflections cite "
+                    f"'timeout' ({timeout_count / len(reflections):.0%}) on "
+                    f"'{task_family}'. Raise task budget_ms by 50% for this "
+                    f"family in the Planner default, or split the family into "
+                    f"sub-types (fast_{task_family} vs deep_{task_family}) with "
+                    f"separate budgets."
+                ),
+                "action_hint": {
+                    "kind": "increase_task_budget",
+                    "task_family": task_family,
+                    "budget_multiplier": 1.5,
                 },
                 "expected_gain": 0.25,
                 "risk_score": 0.15,
