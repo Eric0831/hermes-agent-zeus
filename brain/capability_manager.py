@@ -359,6 +359,10 @@ def execute_action(db: Any, version_id: str) -> dict:
         result = _execute_extract_precedents(db, v, action_hint)
         return {"executed": True, "kind": kind, "result": result, "note": ""}
 
+    if kind == "update_recommended_tools":
+        result = _execute_update_recommended_tools(db, v, action_hint)
+        return {"executed": True, "kind": kind, "result": result, "note": ""}
+
     return {
         "executed": False,
         "kind": kind,
@@ -598,6 +602,69 @@ def _execute_extract_precedents(
         "family": family,
         "tasks_sampled": len(tasks),
         "precedent_ids": created[:3] + (["..."] if len(created) > 3 else []),
+    }
+
+
+def _execute_update_recommended_tools(
+    db: Any, version: dict, action_hint: dict,
+) -> dict:
+    """Materialize a high-performing-tool finding into a routing doctrine.
+
+    action_hint carries:
+        {"kind": "update_recommended_tools",
+         "task_family": "<family>",
+         "prefer": ["tool1", "tool2", ...]}
+
+    We write a doctrine in 'proposed' status so it stays gated behind
+    doctrine_engine.ratify_doctrine before any Planner actually reads
+    it. This keeps the evolution loop safe — automation writes a
+    proposal, a human (or a future governance agent) ratifies it.
+
+    Returns {"doctrine_id", "name", "domain", "prefer": [...]}.
+    """
+    from brain import doctrine_engine
+
+    family = action_hint.get("task_family") or version.get("capability_family", "").split(":", 1)[-1]
+    prefer = action_hint.get("prefer") or []
+    if isinstance(prefer, str):
+        prefer = [prefer]
+    prefer = [str(t).strip() for t in prefer if str(t).strip()]
+    if not prefer:
+        return {
+            "doctrine_id": None,
+            "family": family,
+            "prefer": [],
+            "note": "action_hint.prefer is empty — nothing to route",
+        }
+
+    name = f"recommended_tools:{family}"
+    definition = {
+        "policy": "tool_preference_order",
+        "task_family": family,
+        "prefer_order": prefer,
+        "rationale": (
+            f"High-performing tools for '{family}' surfaced by meta_learning; "
+            "Planner should try them first before falling back to alternatives."
+        ),
+        "source": {
+            "kind": "capability_version",
+            "version_id": version["id"],
+            "source_proposal_id": version.get("source_proposal_id"),
+        },
+    }
+    did = doctrine_engine.propose_doctrine(
+        db,
+        name=name,
+        domain="routing",
+        definition=definition,
+    )
+    return {
+        "doctrine_id": did,
+        "name": name,
+        "domain": "routing",
+        "status": "proposed",
+        "prefer": prefer,
+        "note": "doctrine proposed — ratify via doctrine_engine.ratify_doctrine to activate",
     }
 
 
