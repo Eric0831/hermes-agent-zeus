@@ -411,6 +411,41 @@ def handle_function_call(
         except Exception:
             pass
 
+        # AgentEOS policy evaluation (audit mode): log the decision the
+        # policy engine would have made for this tool call. Does not yet
+        # block dispatch — this starts populating policy_evaluations with
+        # real runtime data so enforcement thresholds can be tuned from
+        # evidence before we flip the switch.
+        try:
+            from brain.policy import evaluate as _policy_evaluate
+            from hermes_state import SessionDB as _SessionDB
+            _policy_db = _SessionDB()
+            _task_risk = "low"
+            if task_id:
+                try:
+                    _row = _policy_db._conn.execute(
+                        "SELECT risk_level FROM tasks WHERE id = ?", (task_id,),
+                    ).fetchone()
+                    if _row:
+                        _task_risk = _row["risk_level"] if hasattr(_row, "keys") else _row[0]
+                except Exception:
+                    pass
+            _pd = _policy_evaluate(
+                action_type="tool_call",
+                target=function_name,
+                task_id=task_id,
+                task_risk_level=_task_risk,
+                db=_policy_db,
+            )
+            if _pd.decision != "allow":
+                logger = __import__("logging").getLogger(__name__)
+                logger.warning(
+                    "[Policy/audit] tool=%s task=%s decision=%s risk=%s reason=%s",
+                    function_name, task_id or "-", _pd.decision, _pd.risk_level, _pd.reason,
+                )
+        except Exception:
+            pass  # audit must never block dispatch
+
         if function_name == "execute_code":
             # Prefer the caller-provided list so subagents can't overwrite
             # the parent's tool set via the process-global.
