@@ -363,6 +363,10 @@ def execute_action(db: Any, version_id: str) -> dict:
         result = _execute_update_recommended_tools(db, v, action_hint)
         return {"executed": True, "kind": kind, "result": result, "note": ""}
 
+    if kind in _POLICY_CHANGE_KINDS:
+        result = _execute_planner_policy_change(db, v, action_hint)
+        return {"executed": True, "kind": kind, "result": result, "note": ""}
+
     return {
         "executed": False,
         "kind": kind,
@@ -372,6 +376,112 @@ def execute_action(db: Any, version_id: str) -> dict:
             "Operator should apply the suggestion manually; a future commit will "
             "wire the executor."
         ),
+    }
+
+
+# Kinds that land in planner_policies (is_active=0) awaiting ratification.
+_POLICY_CHANGE_KINDS = {
+    "update_planner_prompt",
+    "update_planner_examples",
+    "toggle_verifier_llm",
+    "add_verifier_criterion_type",
+    "add_tool_fallback",
+    "increase_retry_budget",
+    "increase_task_budget",
+}
+
+
+def _execute_planner_policy_change(
+    db: Any, version: dict, action_hint: dict,
+) -> dict:
+    """Write a planner_policies row (is_active=0) proposing a per-family
+    Planner/Verifier config change. Ratification flips is_active=1 — no
+    automated actor runs that today (operator-gated by design).
+
+    Covers the 7 action_hint kinds that target per-family config:
+      update_planner_prompt       → prompt_directive
+      update_planner_examples     → few_shot_examples
+      toggle_verifier_llm         → verifier_llm
+      add_verifier_criterion_type → verifier_criterion
+      add_tool_fallback           → tool_fallback
+      increase_retry_budget       → max_retries
+      increase_task_budget        → budget_multiplier
+    """
+    kind = action_hint.get("kind", "")
+    family = action_hint.get("task_family") or version.get("capability_family", "").split(":", 1)[-1]
+
+    # Pack kind-specific parameters into a policy_json payload
+    _KIND_KEY_MAP = {
+        "update_planner_prompt":       ("prompt_directive", ["focus"]),
+        "update_planner_examples":     ("few_shot_examples", ["source"]),
+        "toggle_verifier_llm":         ("verifier_llm", ["duration_days"]),
+        "add_verifier_criterion_type": ("verifier_criterion", ["requires"]),
+        "add_tool_fallback":           ("tool_fallback", ["skill_name"]),
+        "increase_retry_budget":       ("max_retries", ["new_max_retries"]),
+        "increase_task_budget":        ("budget_multiplier", ["budget_multiplier"]),
+    }
+    pack_key, pack_source_keys = _KIND_KEY_MAP.get(kind, (kind, []))
+    pack_value: Any
+    if len(pack_source_keys) == 1:
+        pack_value = action_hint.get(pack_source_keys[0])
+    else:
+        pack_value = {k: action_hint.get(k) for k in pack_source_keys}
+    if pack_value in (None, "", {}):
+        pack_value = True  # presence signal when no concrete value supplied
+
+    policy = {
+        "kind": kind,
+        "task_family": family,
+        pack_key: pack_value,
+        "source": {
+            "capability_version_id": version["id"],
+            "source_proposal_id": version.get("source_proposal_id"),
+        },
+        "rationale": action_hint.get("rationale")
+        or f"proposed via capability_version {version['id']}",
+    }
+
+    # Version sequence per task_family (planner_policies doesn't enforce
+    # uniqueness — just keep the numbering sane)
+    row = db._conn.execute(
+        """SELECT MAX(CAST(version AS INTEGER)) AS max_v
+           FROM planner_policies WHERE task_family = ?""",
+        (family,),
+    ).fetchone()
+    try:
+        max_v = int((row["max_v"] if hasattr(row, "keys") else row[0]) or 0)
+    except (TypeError, ValueError):
+        max_v = 0
+    new_version = str(max_v + 1)
+
+    import uuid as _uuid
+    pid = f"ppol_{_uuid.uuid4().hex[:12]}"
+    now = time.time()
+
+    def _do(conn):
+        conn.execute(
+            """INSERT INTO planner_policies
+               (id, task_family, policy_json, version, is_active, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                pid, family,
+                json.dumps(policy, ensure_ascii=False, default=str),
+                new_version, 0, now,
+            ),
+        )
+
+    db._execute_write(_do)
+    logger.info(
+        "[CapabilityManager] %s policy %s v%s for family '%s' (inactive — needs ratify)",
+        kind, pid, new_version, family,
+    )
+    return {
+        "policy_id": pid,
+        "kind": kind,
+        "family": family,
+        "version": new_version,
+        "is_active": False,
+        "note": "planner_policies row written with is_active=0 — operator must ratify",
     }
 
 
