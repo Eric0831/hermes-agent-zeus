@@ -3378,6 +3378,51 @@ class GatewayRunner:
                 except Exception as e:
                     return f"Approve failed: {e}"
 
+            # /tasks governance [limit] — recent governance_reviews (audit)
+            if args.startswith("governance"):
+                try:
+                    from brain.governance import get_governance_stats
+                    import time as _time
+                    parts = args.split()[1:]
+                    try:
+                        limit = int(parts[0]) if parts else 10
+                    except Exception:
+                        limit = 10
+                    stats = get_governance_stats(db)
+                    rows = db._conn.execute(
+                        """SELECT id, reviewer_id, subject_id, risk_score,
+                                  decision, notes, created_at
+                           FROM governance_reviews
+                           ORDER BY created_at DESC LIMIT ?""",
+                        (limit,),
+                    ).fetchall()
+                    lines = [
+                        f"**Governance Reviews**  total_rows={stats.get('total', 0)}",
+                        "",
+                    ]
+                    if not rows:
+                        lines.append("(no reviews logged)")
+                    else:
+                        for r in rows:
+                            rd = dict(r) if hasattr(r, "keys") else {}
+                            ts = _time.strftime(
+                                "%m-%d %H:%M",
+                                _time.localtime(rd.get("created_at") or 0),
+                            )
+                            reviewer = rd.get("reviewer_id") or "-"
+                            decision = rd.get("decision") or "-"
+                            risk = rd.get("risk_score") or 0.0
+                            subj = (rd.get("subject_id") or "")[:18]
+                            lines.append(
+                                f"  {ts}  {reviewer:17s} {decision:8s} "
+                                f"risk={risk:.2f}  {subj}"
+                            )
+                            if rd.get("notes"):
+                                lines.append(f"    {(rd['notes'] or '')[:100]}")
+                    return "\n".join(lines)
+                except Exception as e:
+                    return f"Governance listing failed: {e}"
+
             # /tasks versions [status] — list capability_versions
             if args.startswith("versions"):
                 try:

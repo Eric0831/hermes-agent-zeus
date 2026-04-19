@@ -33,7 +33,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from hermes_state import SessionDB  # noqa: E402
-from brain import evolution_architect, capability_manager  # noqa: E402
+from brain import evolution_architect, capability_manager, governance  # noqa: E402
 
 
 GATEWAYS = {
@@ -96,11 +96,30 @@ def process_gateway(
             continue
 
         if apply:
+            kind = (
+                json.loads(p.get("proposal_json") or "{}")
+                .get("action_hint", {})
+                .get("kind")
+            )
+            # Log the decision to governance_reviews BEFORE state change
+            # so the audit trail survives even if the promote fails.
+            governance.review_proposal(
+                db,
+                subject_type="capability_proposal",
+                subject_id=p["id"],
+                risk_score=float(p.get("risk_score") or 0.0),
+                decision="approve",
+                notes=(
+                    f"auto_governance kind={kind} "
+                    f"gain={p.get('expected_gain')} risk={p.get('risk_score')}"
+                ),
+                reviewer_id="auto_governance",
+            )
             evolution_architect.update_proposal_status(
                 db, p["id"], "approved",
                 reason=(
                     f"auto_governance (risk<={max_risk}, gain>={min_gain}, "
-                    f"kind={json.loads(p.get('proposal_json') or '{}').get('action_hint', {}).get('kind')})"
+                    f"kind={kind})"
                 ),
             )
             try:
@@ -109,6 +128,15 @@ def process_gateway(
             except Exception as exc:
                 # rollback the approve-only if we can't promote — keep
                 # pipeline honest
+                governance.review_proposal(
+                    db,
+                    subject_type="capability_proposal",
+                    subject_id=p["id"],
+                    risk_score=float(p.get("risk_score") or 0.0),
+                    decision="reject",
+                    notes=f"auto_governance_promote_failed: {exc}",
+                    reviewer_id="auto_governance",
+                )
                 evolution_architect.update_proposal_status(
                     db, p["id"], "rejected",
                     reason=f"auto_governance_promote_failed: {exc}",
