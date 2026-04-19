@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Hermes Governance Auto-Approve Daily at 04:15
+
+[Timer]
+OnCalendar=*-*-* 04:15:00
+Persistent=true
+RandomizedDelaySec=5m
+Unit=hermes-governance-auto.service
+
+[Install]
+WantedBy=timers.target

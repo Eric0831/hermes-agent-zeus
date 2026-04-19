@@ -1,0 +1,14 @@
+[Unit]
+Description=Hermes Governance Auto-Approve (low-risk proposals → incubating)
+After=network.target hermes-meta-learning-cycle.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/testai/.hermes/hermes-agent
+Environment="PATH=/home/testai/.hermes/hermes-agent/venv/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/home/testai/.hermes/hermes-agent/venv/bin/python /home/testai/.hermes/hermes-agent/scripts/hermes_governance_auto.py --apply
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
