@@ -32,7 +32,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 14
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -89,6 +89,667 @@ CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
+
+-- AgentEOS brain tables (v7)
+CREATE TABLE IF NOT EXISTS tasks (
+    id TEXT PRIMARY KEY,
+    parent_task_id TEXT,
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    event_text TEXT,
+    task_type TEXT NOT NULL DEFAULT 'general',
+    goal TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'received',
+    priority TEXT NOT NULL DEFAULT 'medium',
+    risk_level TEXT NOT NULL DEFAULT 'low',
+    plan_json TEXT,
+    budget_tokens INTEGER,
+    budget_ms INTEGER,
+    requires_approval INTEGER NOT NULL DEFAULT 0,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    max_retries INTEGER NOT NULL DEFAULT 2,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    started_at REAL,
+    completed_at REAL,
+    failure_reason TEXT,
+    verification_status TEXT,
+    verification_json TEXT,
+    FOREIGN KEY (parent_task_id) REFERENCES tasks(id)
+);
+CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks(session_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_task_id);
+
+CREATE TABLE IF NOT EXISTS task_criteria (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL REFERENCES tasks(id),
+    criterion_key TEXT NOT NULL,
+    description TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    evidence_ids TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_criteria_task ON task_criteria(task_id);
+
+CREATE TABLE IF NOT EXISTS evidence_records (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id),
+    source_type TEXT NOT NULL,
+    source_ref TEXT,
+    tool_name TEXT,
+    summary TEXT,
+    payload_json TEXT,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_evidence_task ON evidence_records(task_id);
+
+CREATE TABLE IF NOT EXISTS task_transitions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL REFERENCES tasks(id),
+    from_state TEXT NOT NULL,
+    to_state TEXT NOT NULL,
+    reason TEXT,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_transitions_task ON task_transitions(task_id);
+
+CREATE TABLE IF NOT EXISTS policy_evaluations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT,
+    action_type TEXT NOT NULL,
+    target TEXT NOT NULL,
+    risk_level TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    reason TEXT,
+    created_at REAL NOT NULL
+);
+
+-- AgentEOS v2 tables (v8)
+CREATE TABLE IF NOT EXISTS memory_records (
+    id TEXT PRIMARY KEY,
+    memory_type TEXT NOT NULL,
+    scope_type TEXT NOT NULL DEFAULT 'session',
+    scope_id TEXT NOT NULL,
+    title TEXT,
+    content_json TEXT NOT NULL,
+    source_task_id TEXT,
+    confidence REAL NOT NULL DEFAULT 0.8,
+    freshness_score REAL NOT NULL DEFAULT 1.0,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    expires_at REAL,
+    supersedes_id TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_memory_type ON memory_records(memory_type);
+CREATE INDEX IF NOT EXISTS idx_memory_scope ON memory_records(scope_type, scope_id);
+CREATE INDEX IF NOT EXISTS idx_memory_active ON memory_records(is_active);
+
+CREATE TABLE IF NOT EXISTS skill_registry (
+    id TEXT PRIMARY KEY,
+    skill_name TEXT NOT NULL,
+    intent_family TEXT NOT NULL,
+    version TEXT NOT NULL DEFAULT '1.0',
+    status TEXT NOT NULL DEFAULT 'candidate',
+    definition_json TEXT NOT NULL,
+    success_rate REAL NOT NULL DEFAULT 0.0,
+    usage_count INTEGER NOT NULL DEFAULT 0,
+    last_used_at REAL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    risk_level TEXT NOT NULL DEFAULT 'low',
+    source_task_id TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_skill_family ON skill_registry(intent_family);
+CREATE INDEX IF NOT EXISTS idx_skill_status ON skill_registry(status);
+
+CREATE TABLE IF NOT EXISTS skill_applications (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    skill_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    result_summary TEXT,
+    created_at REAL NOT NULL,
+    completed_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_skill_app_task ON skill_applications(task_id);
+
+CREATE TABLE IF NOT EXISTS reflections (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    task_family TEXT NOT NULL,
+    reflection_json TEXT NOT NULL,
+    root_cause_class TEXT,
+    confidence REAL NOT NULL DEFAULT 0.5,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reflections_task ON reflections(task_id);
+CREATE INDEX IF NOT EXISTS idx_reflections_family ON reflections(task_family);
+
+-- DEPRECATED: planner_policies is unused since v3; replaced by strategy_versions.
+-- Kept for schema compatibility. Will be removed in schema v10.
+CREATE TABLE IF NOT EXISTS planner_policies (
+    id TEXT PRIMARY KEY,
+    task_family TEXT NOT NULL,
+    policy_json TEXT NOT NULL,
+    version TEXT NOT NULL DEFAULT '1.0',
+    is_active INTEGER NOT NULL DEFAULT 1,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_planner_policy_family ON planner_policies(task_family);
+
+-- AgentEOS v3 tables (v9)
+CREATE TABLE IF NOT EXISTS meta_learning_runs (
+    id TEXT PRIMARY KEY,
+    run_type TEXT NOT NULL DEFAULT 'periodic',
+    scope_type TEXT NOT NULL DEFAULT 'global',
+    scope_id TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    tasks_analyzed INTEGER NOT NULL DEFAULT 0,
+    findings_count INTEGER NOT NULL DEFAULT 0,
+    summary_json TEXT,
+    started_at REAL,
+    completed_at REAL,
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS meta_learning_findings (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES meta_learning_runs(id),
+    finding_type TEXT NOT NULL,
+    task_family TEXT,
+    confidence REAL NOT NULL DEFAULT 0.5,
+    impact_score REAL NOT NULL DEFAULT 0.0,
+    finding_json TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_findings_run ON meta_learning_findings(run_id);
+
+CREATE TABLE IF NOT EXISTS strategy_versions (
+    id TEXT PRIMARY KEY,
+    strategy_type TEXT NOT NULL,
+    scope_id TEXT NOT NULL,
+    version TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'proposed',
+    definition_json TEXT NOT NULL,
+    source_run_id TEXT,
+    created_at REAL NOT NULL,
+    activated_at REAL,
+    deprecated_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_strategy_scope ON strategy_versions(scope_id);
+
+CREATE TABLE IF NOT EXISTS cross_task_patterns (
+    id TEXT PRIMARY KEY,
+    pattern_type TEXT NOT NULL,
+    task_family TEXT NOT NULL,
+    pattern_json TEXT NOT NULL,
+    confidence REAL NOT NULL DEFAULT 0.5,
+    support_count INTEGER NOT NULL DEFAULT 1,
+    success_delta REAL,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_patterns_family ON cross_task_patterns(task_family);
+
+CREATE TABLE IF NOT EXISTS proactive_actions (
+    id TEXT PRIMARY KEY,
+    action_type TEXT NOT NULL,
+    target_scope_type TEXT NOT NULL,
+    target_scope_id TEXT NOT NULL,
+    reason_json TEXT NOT NULL,
+    risk_level TEXT NOT NULL DEFAULT 'low',
+    requires_approval INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at REAL NOT NULL,
+    executed_at REAL
+);
+
+CREATE TABLE IF NOT EXISTS governance_reviews (
+    id TEXT PRIMARY KEY,
+    review_type TEXT NOT NULL,
+    subject_type TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    risk_score REAL NOT NULL DEFAULT 0.0,
+    decision TEXT NOT NULL,
+    notes TEXT,
+    created_at REAL NOT NULL,
+    reviewer_id TEXT
+);
+
+-- AgentEOS v4 tables (v10)
+CREATE TABLE IF NOT EXISTS capability_proposals (
+    id TEXT PRIMARY KEY,
+    proposal_type TEXT NOT NULL,
+    target_task_family TEXT NOT NULL,
+    title TEXT NOT NULL,
+    proposal_json TEXT NOT NULL,
+    expected_gain REAL NOT NULL DEFAULT 0.0,
+    risk_score REAL NOT NULL DEFAULT 0.0,
+    source_run_id TEXT,
+    status TEXT NOT NULL DEFAULT 'proposed',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cap_prop_family ON capability_proposals(target_task_family);
+CREATE INDEX IF NOT EXISTS idx_cap_prop_status ON capability_proposals(status);
+
+CREATE TABLE IF NOT EXISTS capability_versions (
+    id TEXT PRIMARY KEY,
+    capability_family TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL DEFAULT 'proposed',
+    definition_json TEXT NOT NULL,
+    parent_version_id TEXT,
+    source_proposal_id TEXT,
+    created_at REAL NOT NULL,
+    activated_at REAL,
+    deprecated_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_cap_ver_family ON capability_versions(capability_family);
+CREATE INDEX IF NOT EXISTS idx_cap_ver_status ON capability_versions(status);
+
+CREATE TABLE IF NOT EXISTS incubator_runs (
+    id TEXT PRIMARY KEY,
+    capability_version_id TEXT NOT NULL,
+    run_type TEXT NOT NULL,
+    scope_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    baseline_metrics_json TEXT,
+    candidate_metrics_json TEXT,
+    summary_json TEXT,
+    started_at REAL NOT NULL,
+    completed_at REAL
+);
+
+CREATE TABLE IF NOT EXISTS experiment_runs (
+    id TEXT PRIMARY KEY,
+    capability_version_id TEXT NOT NULL,
+    experiment_type TEXT NOT NULL,
+    task_family TEXT NOT NULL,
+    rollout_percent REAL NOT NULL DEFAULT 10.0,
+    status TEXT NOT NULL DEFAULT 'created',
+    baseline_json TEXT,
+    candidate_json TEXT,
+    result TEXT,
+    started_at REAL NOT NULL,
+    completed_at REAL
+);
+
+CREATE TABLE IF NOT EXISTS constitution_rules (
+    id TEXT PRIMARY KEY,
+    rule_type TEXT NOT NULL,
+    scope TEXT NOT NULL DEFAULT 'global',
+    definition_json TEXT NOT NULL,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS recursive_reflections (
+    id TEXT PRIMARY KEY,
+    scope_type TEXT NOT NULL,
+    scope_id TEXT NOT NULL,
+    reflection_level TEXT NOT NULL,
+    reflection_json TEXT NOT NULL,
+    confidence REAL NOT NULL DEFAULT 0.5,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_recur_refl_scope ON recursive_reflections(scope_type, scope_id);
+
+-- AgentEOS v5 tables (v11) — Civilizational Intelligence
+CREATE TABLE IF NOT EXISTS doctrine_registry (
+    id TEXT PRIMARY KEY,
+    doctrine_name TEXT NOT NULL,
+    domain TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL DEFAULT 'proposed',
+    definition_json TEXT NOT NULL,
+    ratified_by TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_doctrine_domain ON doctrine_registry(domain);
+CREATE INDEX IF NOT EXISTS idx_doctrine_status ON doctrine_registry(status);
+
+CREATE TABLE IF NOT EXISTS precedent_records (
+    id TEXT PRIMARY KEY,
+    precedent_type TEXT NOT NULL,
+    subject_type TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    decision_json TEXT NOT NULL,
+    binding_strength REAL NOT NULL DEFAULT 0.5,
+    source_review_id TEXT,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_precedent_subject ON precedent_records(subject_type, subject_id);
+
+CREATE TABLE IF NOT EXISTS institutional_memory (
+    id TEXT PRIMARY KEY,
+    memory_type TEXT NOT NULL,
+    scope_type TEXT NOT NULL,
+    scope_id TEXT NOT NULL,
+    content_json TEXT NOT NULL,
+    lineage_json TEXT,
+    confidence REAL NOT NULL DEFAULT 0.7,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_inst_mem_type ON institutional_memory(memory_type);
+
+CREATE TABLE IF NOT EXISTS agent_clusters (
+    id TEXT PRIMARY KEY,
+    cluster_name TEXT NOT NULL,
+    jurisdiction_json TEXT NOT NULL,
+    authority_level TEXT NOT NULL DEFAULT 'operational',
+    trust_score REAL NOT NULL DEFAULT 0.5,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS deliberation_sessions (
+    id TEXT PRIMARY KEY,
+    session_type TEXT NOT NULL,
+    subject_type TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',
+    resolution_json TEXT,
+    started_at REAL NOT NULL,
+    completed_at REAL
+);
+
+CREATE TABLE IF NOT EXISTS deliberation_positions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES deliberation_sessions(id),
+    cluster_id TEXT NOT NULL,
+    position_type TEXT NOT NULL,
+    position_json TEXT NOT NULL,
+    weight REAL NOT NULL DEFAULT 1.0,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_delib_pos_session ON deliberation_positions(session_id);
+
+CREATE TABLE IF NOT EXISTS civilization_risks (
+    id TEXT PRIMARY KEY,
+    risk_type TEXT NOT NULL,
+    severity TEXT NOT NULL DEFAULT 'medium',
+    scope_json TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'detected',
+    mitigation_json TEXT,
+    created_at REAL NOT NULL,
+    resolved_at REAL
+);
+
+CREATE TABLE IF NOT EXISTS cultural_drift_events (
+    id TEXT PRIMARY KEY,
+    drift_type TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    signals_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'detected',
+    detected_at REAL NOT NULL,
+    resolved_at REAL
+);
+
+-- AgentEOS v6 tables (v12) — Trans-Civilizational Intelligence
+CREATE TABLE IF NOT EXISTS epochs (
+    id TEXT PRIMARY KEY,
+    epoch_name TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    summary_json TEXT,
+    started_at REAL NOT NULL,
+    ended_at REAL,
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS continuity_proofs (
+    id TEXT PRIMARY KEY,
+    subject_type TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    from_epoch_id TEXT,
+    to_epoch_id TEXT,
+    proof_json TEXT NOT NULL,
+    continuity_score REAL NOT NULL DEFAULT 0.5,
+    verdict TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cont_proof_subject ON continuity_proofs(subject_type, subject_id);
+
+CREATE TABLE IF NOT EXISTS civilization_migrations (
+    id TEXT PRIMARY KEY,
+    source_epoch_id TEXT NOT NULL,
+    target_epoch_id TEXT,
+    migration_type TEXT NOT NULL,
+    plan_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'proposed',
+    created_at REAL NOT NULL,
+    started_at REAL,
+    completed_at REAL
+);
+
+CREATE TABLE IF NOT EXISTS paradigm_shifts (
+    id TEXT PRIMARY KEY,
+    shift_type TEXT NOT NULL,
+    description_json TEXT NOT NULL,
+    severity TEXT NOT NULL DEFAULT 'medium',
+    status TEXT NOT NULL DEFAULT 'detected',
+    epoch_id TEXT,
+    created_at REAL NOT NULL,
+    resolved_at REAL
+);
+
+CREATE TABLE IF NOT EXISTS external_civilizations (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    profile_json TEXT NOT NULL,
+    trust_score REAL NOT NULL DEFAULT 0.5,
+    risk_score REAL NOT NULL DEFAULT 0.5,
+    status TEXT NOT NULL DEFAULT 'observed',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS treaties (
+    id TEXT PRIMARY KEY,
+    external_civ_id TEXT NOT NULL,
+    treaty_type TEXT NOT NULL,
+    definition_json TEXT NOT NULL,
+    risk_json TEXT,
+    status TEXT NOT NULL DEFAULT 'proposed',
+    created_at REAL NOT NULL,
+    ratified_at REAL,
+    terminated_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_treaty_civ ON treaties(external_civ_id);
+
+CREATE TABLE IF NOT EXISTS existential_events (
+    id TEXT PRIMARY KEY,
+    risk_type TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    signals_json TEXT NOT NULL,
+    response_json TEXT,
+    status TEXT NOT NULL DEFAULT 'detected',
+    detected_at REAL NOT NULL,
+    resolved_at REAL
+);
+
+CREATE TABLE IF NOT EXISTS deep_time_memory (
+    id TEXT PRIMARY KEY,
+    memory_type TEXT NOT NULL,
+    epoch_id TEXT,
+    content_json TEXT NOT NULL,
+    lineage_json TEXT,
+    confidence REAL NOT NULL DEFAULT 0.7,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dtm_type ON deep_time_memory(memory_type);
+CREATE INDEX IF NOT EXISTS idx_dtm_epoch ON deep_time_memory(epoch_id);
+
+CREATE TABLE IF NOT EXISTS meta_senate_sessions (
+    id TEXT PRIMARY KEY,
+    session_type TEXT NOT NULL,
+    subject_type TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',
+    resolution_json TEXT,
+    started_at REAL NOT NULL,
+    completed_at REAL
+);
+
+CREATE TABLE IF NOT EXISTS meta_senate_positions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES meta_senate_sessions(id),
+    participant_id TEXT NOT NULL,
+    position_type TEXT NOT NULL,
+    position_json TEXT NOT NULL,
+    weight REAL NOT NULL DEFAULT 1.0,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ms_pos_session ON meta_senate_positions(session_id);
+
+-- AgentEOS Evolution Dynamics tables (v13)
+CREATE TABLE IF NOT EXISTS evolution_units (
+    id TEXT PRIMARY KEY,
+    unit_type TEXT NOT NULL,
+    layer TEXT NOT NULL,
+    family TEXT NOT NULL,
+    version TEXT NOT NULL DEFAULT '1.0',
+    status TEXT NOT NULL DEFAULT 'candidate',
+    definition_json TEXT NOT NULL,
+    parent_unit_id TEXT,
+    risk_level TEXT NOT NULL DEFAULT 'low',
+    governance_scope TEXT NOT NULL DEFAULT 'auto',
+    inheritance_mode TEXT,
+    transmission_mode TEXT,
+    stability_class TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_eu_family ON evolution_units(family);
+CREATE INDEX IF NOT EXISTS idx_eu_status ON evolution_units(status);
+CREATE INDEX IF NOT EXISTS idx_eu_layer ON evolution_units(layer);
+
+CREATE TABLE IF NOT EXISTS evolution_mutations (
+    id TEXT PRIMARY KEY,
+    unit_id TEXT NOT NULL REFERENCES evolution_units(id),
+    mutation_type TEXT NOT NULL,
+    mutation_json TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS fitness_runs (
+    id TEXT PRIMARY KEY,
+    unit_id TEXT NOT NULL REFERENCES evolution_units(id),
+    fitness_type TEXT NOT NULL,
+    metrics_json TEXT NOT NULL,
+    weights_json TEXT NOT NULL,
+    score REAL NOT NULL,
+    window_start REAL NOT NULL,
+    window_end REAL NOT NULL,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_fit_unit ON fitness_runs(unit_id);
+
+CREATE TABLE IF NOT EXISTS selection_decisions (
+    id TEXT PRIMARY KEY,
+    unit_id TEXT NOT NULL REFERENCES evolution_units(id),
+    fitness_run_id TEXT,
+    decision TEXT NOT NULL,
+    decision_reason TEXT,
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS inheritance_links (
+    id TEXT PRIMARY KEY,
+    parent_unit_id TEXT NOT NULL,
+    child_unit_id TEXT NOT NULL,
+    inheritance_type TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_inh_parent ON inheritance_links(parent_unit_id);
+CREATE INDEX IF NOT EXISTS idx_inh_child ON inheritance_links(child_unit_id);
+
+CREATE TABLE IF NOT EXISTS replicator_weights (
+    id TEXT PRIMARY KEY,
+    family TEXT NOT NULL,
+    unit_id TEXT NOT NULL,
+    weight REAL NOT NULL,
+    window_label TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rep_family ON replicator_weights(family);
+
+CREATE TABLE IF NOT EXISTS evolution_experiments (
+    id TEXT PRIMARY KEY,
+    experiment_type TEXT NOT NULL,
+    unit_id TEXT NOT NULL,
+    baseline_unit_id TEXT,
+    scope_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'created',
+    metrics_json TEXT,
+    started_at REAL NOT NULL,
+    completed_at REAL
+);
+
+-- Evolution Dynamics v1.1 tables (v14) — Gene-Culture, Epigenetic, Multilevel, Criticality
+CREATE TABLE IF NOT EXISTS epigenetic_markers (
+    id TEXT PRIMARY KEY,
+    unit_id TEXT NOT NULL,
+    context_type TEXT NOT NULL,
+    expression_weight REAL NOT NULL DEFAULT 1.0,
+    activation_state TEXT NOT NULL DEFAULT 'neutral',
+    reversible INTEGER NOT NULL DEFAULT 1,
+    expires_at REAL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_epi_unit ON epigenetic_markers(unit_id);
+
+CREATE TABLE IF NOT EXISTS group_fitness_runs (
+    id TEXT PRIMARY KEY,
+    family TEXT NOT NULL,
+    scope_type TEXT NOT NULL,
+    scope_id TEXT NOT NULL,
+    metrics_json TEXT NOT NULL,
+    score REAL NOT NULL,
+    window_start REAL NOT NULL,
+    window_end REAL NOT NULL,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_gfit_family ON group_fitness_runs(family);
+
+CREATE TABLE IF NOT EXISTS multilevel_selection_runs (
+    id TEXT PRIMARY KEY,
+    unit_id TEXT NOT NULL,
+    individual_fitness_run_id TEXT NOT NULL,
+    group_fitness_run_id TEXT NOT NULL,
+    alpha REAL NOT NULL,
+    total_score REAL NOT NULL,
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS criticality_snapshots (
+    id TEXT PRIMARY KEY,
+    scope_type TEXT NOT NULL,
+    scope_id TEXT NOT NULL,
+    cascade_frequency REAL NOT NULL DEFAULT 0.0,
+    correlation_length REAL NOT NULL DEFAULT 0.0,
+    distance_to_critical REAL NOT NULL DEFAULT 1.0,
+    status TEXT NOT NULL DEFAULT 'stable',
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS gene_culture_transmissions (
+    id TEXT PRIMARY KEY,
+    unit_id TEXT NOT NULL,
+    transmission_kind TEXT NOT NULL,
+    source_scope TEXT NOT NULL,
+    target_scope TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
 """
 
 FTS_SQL = """
@@ -330,6 +991,518 @@ class SessionDB:
                     except sqlite3.OperationalError:
                         pass  # Column already exists
                 cursor.execute("UPDATE schema_version SET version = 6")
+            if current_version < 7:
+                # v7: AgentEOS brain tables — task tracking, evidence, transitions
+                cursor.executescript("""
+                    CREATE TABLE IF NOT EXISTS tasks (
+                        id TEXT PRIMARY KEY,
+                        parent_task_id TEXT,
+                        session_id TEXT NOT NULL REFERENCES sessions(id),
+                        event_text TEXT,
+                        task_type TEXT NOT NULL DEFAULT 'general',
+                        goal TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'received',
+                        priority TEXT NOT NULL DEFAULT 'medium',
+                        risk_level TEXT NOT NULL DEFAULT 'low',
+                        plan_json TEXT,
+                        budget_tokens INTEGER,
+                        budget_ms INTEGER,
+                        requires_approval INTEGER NOT NULL DEFAULT 0,
+                        retry_count INTEGER NOT NULL DEFAULT 0,
+                        max_retries INTEGER NOT NULL DEFAULT 2,
+                        created_at REAL NOT NULL,
+                        updated_at REAL NOT NULL,
+                        started_at REAL,
+                        completed_at REAL,
+                        failure_reason TEXT,
+                        verification_status TEXT,
+                        verification_json TEXT,
+                        FOREIGN KEY (parent_task_id) REFERENCES tasks(id)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks(session_id);
+                    CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+                    CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_task_id);
+
+                    CREATE TABLE IF NOT EXISTS task_criteria (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        task_id TEXT NOT NULL REFERENCES tasks(id),
+                        criterion_key TEXT NOT NULL,
+                        description TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'pending',
+                        evidence_ids TEXT,
+                        created_at REAL NOT NULL,
+                        updated_at REAL NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_criteria_task ON task_criteria(task_id);
+
+                    CREATE TABLE IF NOT EXISTS evidence_records (
+                        id TEXT PRIMARY KEY,
+                        task_id TEXT NOT NULL REFERENCES tasks(id),
+                        source_type TEXT NOT NULL,
+                        source_ref TEXT,
+                        tool_name TEXT,
+                        summary TEXT,
+                        payload_json TEXT,
+                        created_at REAL NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_evidence_task ON evidence_records(task_id);
+
+                    CREATE TABLE IF NOT EXISTS task_transitions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        task_id TEXT NOT NULL REFERENCES tasks(id),
+                        from_state TEXT NOT NULL,
+                        to_state TEXT NOT NULL,
+                        reason TEXT,
+                        created_at REAL NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_transitions_task ON task_transitions(task_id);
+
+                    CREATE TABLE IF NOT EXISTS policy_evaluations (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        task_id TEXT,
+                        action_type TEXT NOT NULL,
+                        target TEXT NOT NULL,
+                        risk_level TEXT NOT NULL,
+                        decision TEXT NOT NULL,
+                        reason TEXT,
+                        created_at REAL NOT NULL
+                    );
+                """)
+                cursor.execute("UPDATE schema_version SET version = 7")
+                logger.info("Migrated state.db to schema v7 (AgentEOS brain tables)")
+            if current_version < 8:
+                # v8: AgentEOS v2 — memory, skills, reflections, planner policies
+                cursor.executescript("""
+                    CREATE TABLE IF NOT EXISTS memory_records (
+                        id TEXT PRIMARY KEY,
+                        memory_type TEXT NOT NULL,
+                        scope_type TEXT NOT NULL DEFAULT 'session',
+                        scope_id TEXT NOT NULL,
+                        title TEXT,
+                        content_json TEXT NOT NULL,
+                        source_task_id TEXT,
+                        confidence REAL NOT NULL DEFAULT 0.8,
+                        freshness_score REAL NOT NULL DEFAULT 1.0,
+                        is_active INTEGER NOT NULL DEFAULT 1,
+                        created_at REAL NOT NULL,
+                        updated_at REAL NOT NULL,
+                        expires_at REAL,
+                        supersedes_id TEXT
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_memory_type ON memory_records(memory_type);
+                    CREATE INDEX IF NOT EXISTS idx_memory_scope ON memory_records(scope_type, scope_id);
+                    CREATE INDEX IF NOT EXISTS idx_memory_active ON memory_records(is_active);
+
+                    CREATE TABLE IF NOT EXISTS skill_registry (
+                        id TEXT PRIMARY KEY,
+                        skill_name TEXT NOT NULL,
+                        intent_family TEXT NOT NULL,
+                        version TEXT NOT NULL DEFAULT '1.0',
+                        status TEXT NOT NULL DEFAULT 'candidate',
+                        definition_json TEXT NOT NULL,
+                        success_rate REAL NOT NULL DEFAULT 0.0,
+                        usage_count INTEGER NOT NULL DEFAULT 0,
+                        last_used_at REAL,
+                        created_at REAL NOT NULL,
+                        updated_at REAL NOT NULL,
+                        risk_level TEXT NOT NULL DEFAULT 'low',
+                        source_task_id TEXT
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_skill_family ON skill_registry(intent_family);
+                    CREATE INDEX IF NOT EXISTS idx_skill_status ON skill_registry(status);
+
+                    CREATE TABLE IF NOT EXISTS skill_applications (
+                        id TEXT PRIMARY KEY,
+                        task_id TEXT NOT NULL,
+                        skill_id TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        result_summary TEXT,
+                        created_at REAL NOT NULL,
+                        completed_at REAL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_skill_app_task ON skill_applications(task_id);
+
+                    CREATE TABLE IF NOT EXISTS reflections (
+                        id TEXT PRIMARY KEY,
+                        task_id TEXT NOT NULL,
+                        task_family TEXT NOT NULL,
+                        reflection_json TEXT NOT NULL,
+                        root_cause_class TEXT,
+                        confidence REAL NOT NULL DEFAULT 0.5,
+                        created_at REAL NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_reflections_task ON reflections(task_id);
+                    CREATE INDEX IF NOT EXISTS idx_reflections_family ON reflections(task_family);
+
+                    CREATE TABLE IF NOT EXISTS planner_policies (
+                        id TEXT PRIMARY KEY,
+                        task_family TEXT NOT NULL,
+                        policy_json TEXT NOT NULL,
+                        version TEXT NOT NULL DEFAULT '1.0',
+                        is_active INTEGER NOT NULL DEFAULT 1,
+                        created_at REAL NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_planner_policy_family ON planner_policies(task_family);
+                """)
+                cursor.execute("UPDATE schema_version SET version = 8")
+                logger.info("Migrated state.db to schema v8 (AgentEOS v2 tables)")
+            if current_version < 9:
+                cursor.executescript("""
+                    CREATE TABLE IF NOT EXISTS meta_learning_runs (
+                        id TEXT PRIMARY KEY, run_type TEXT NOT NULL DEFAULT 'periodic',
+                        scope_type TEXT NOT NULL DEFAULT 'global', scope_id TEXT,
+                        status TEXT NOT NULL DEFAULT 'pending',
+                        tasks_analyzed INTEGER NOT NULL DEFAULT 0,
+                        findings_count INTEGER NOT NULL DEFAULT 0,
+                        summary_json TEXT, started_at REAL, completed_at REAL,
+                        created_at REAL NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS meta_learning_findings (
+                        id TEXT PRIMARY KEY, run_id TEXT NOT NULL,
+                        finding_type TEXT NOT NULL, task_family TEXT,
+                        confidence REAL NOT NULL DEFAULT 0.5,
+                        impact_score REAL NOT NULL DEFAULT 0.0,
+                        finding_json TEXT NOT NULL, created_at REAL NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_findings_run ON meta_learning_findings(run_id);
+                    CREATE TABLE IF NOT EXISTS strategy_versions (
+                        id TEXT PRIMARY KEY, strategy_type TEXT NOT NULL,
+                        scope_id TEXT NOT NULL, version TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'proposed',
+                        definition_json TEXT NOT NULL, source_run_id TEXT,
+                        created_at REAL NOT NULL, activated_at REAL, deprecated_at REAL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_strategy_scope ON strategy_versions(scope_id);
+                    CREATE TABLE IF NOT EXISTS cross_task_patterns (
+                        id TEXT PRIMARY KEY, pattern_type TEXT NOT NULL,
+                        task_family TEXT NOT NULL, pattern_json TEXT NOT NULL,
+                        confidence REAL NOT NULL DEFAULT 0.5,
+                        support_count INTEGER NOT NULL DEFAULT 1,
+                        success_delta REAL, status TEXT NOT NULL DEFAULT 'active',
+                        created_at REAL NOT NULL, updated_at REAL NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_patterns_family ON cross_task_patterns(task_family);
+                    CREATE TABLE IF NOT EXISTS proactive_actions (
+                        id TEXT PRIMARY KEY, action_type TEXT NOT NULL,
+                        target_scope_type TEXT NOT NULL, target_scope_id TEXT NOT NULL,
+                        reason_json TEXT NOT NULL, risk_level TEXT NOT NULL DEFAULT 'low',
+                        requires_approval INTEGER NOT NULL DEFAULT 0,
+                        status TEXT NOT NULL DEFAULT 'pending',
+                        created_at REAL NOT NULL, executed_at REAL
+                    );
+                    CREATE TABLE IF NOT EXISTS governance_reviews (
+                        id TEXT PRIMARY KEY, review_type TEXT NOT NULL,
+                        subject_type TEXT NOT NULL, subject_id TEXT NOT NULL,
+                        risk_score REAL NOT NULL DEFAULT 0.0,
+                        decision TEXT NOT NULL, notes TEXT,
+                        created_at REAL NOT NULL, reviewer_id TEXT
+                    );
+                """)
+                cursor.execute("UPDATE schema_version SET version = 9")
+                logger.info("Migrated state.db to schema v9 (AgentEOS v3 tables)")
+            if current_version < 10:
+                cursor.executescript("""
+                    CREATE TABLE IF NOT EXISTS capability_proposals (
+                        id TEXT PRIMARY KEY, proposal_type TEXT NOT NULL,
+                        target_task_family TEXT NOT NULL, title TEXT NOT NULL,
+                        proposal_json TEXT NOT NULL, expected_gain REAL DEFAULT 0.0,
+                        risk_score REAL DEFAULT 0.0, source_run_id TEXT,
+                        status TEXT NOT NULL DEFAULT 'proposed',
+                        created_at REAL NOT NULL, updated_at REAL NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_cap_prop_family ON capability_proposals(target_task_family);
+                    CREATE INDEX IF NOT EXISTS idx_cap_prop_status ON capability_proposals(status);
+                    CREATE TABLE IF NOT EXISTS capability_versions (
+                        id TEXT PRIMARY KEY, capability_family TEXT NOT NULL,
+                        version INTEGER NOT NULL DEFAULT 1,
+                        status TEXT NOT NULL DEFAULT 'proposed',
+                        definition_json TEXT NOT NULL, parent_version_id TEXT,
+                        source_proposal_id TEXT, created_at REAL NOT NULL,
+                        activated_at REAL, deprecated_at REAL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_cap_ver_family ON capability_versions(capability_family);
+                    CREATE INDEX IF NOT EXISTS idx_cap_ver_status ON capability_versions(status);
+                    CREATE TABLE IF NOT EXISTS incubator_runs (
+                        id TEXT PRIMARY KEY, capability_version_id TEXT NOT NULL,
+                        run_type TEXT NOT NULL, scope_json TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'pending',
+                        baseline_metrics_json TEXT, candidate_metrics_json TEXT,
+                        summary_json TEXT, started_at REAL NOT NULL, completed_at REAL
+                    );
+                    CREATE TABLE IF NOT EXISTS experiment_runs (
+                        id TEXT PRIMARY KEY, capability_version_id TEXT NOT NULL,
+                        experiment_type TEXT NOT NULL, task_family TEXT NOT NULL,
+                        rollout_percent REAL DEFAULT 10.0,
+                        status TEXT NOT NULL DEFAULT 'created',
+                        baseline_json TEXT, candidate_json TEXT, result TEXT,
+                        started_at REAL NOT NULL, completed_at REAL
+                    );
+                    CREATE TABLE IF NOT EXISTS constitution_rules (
+                        id TEXT PRIMARY KEY, rule_type TEXT NOT NULL,
+                        scope TEXT NOT NULL DEFAULT 'global',
+                        definition_json TEXT NOT NULL,
+                        is_active INTEGER NOT NULL DEFAULT 1,
+                        created_at REAL NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS recursive_reflections (
+                        id TEXT PRIMARY KEY, scope_type TEXT NOT NULL,
+                        scope_id TEXT NOT NULL, reflection_level TEXT NOT NULL,
+                        reflection_json TEXT NOT NULL,
+                        confidence REAL NOT NULL DEFAULT 0.5,
+                        created_at REAL NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_recur_refl_scope ON recursive_reflections(scope_type, scope_id);
+                """)
+                cursor.execute("UPDATE schema_version SET version = 10")
+                logger.info("Migrated state.db to schema v10 (AgentEOS v4 tables)")
+            if current_version < 11:
+                cursor.executescript("""
+                    CREATE TABLE IF NOT EXISTS doctrine_registry (
+                        id TEXT PRIMARY KEY, doctrine_name TEXT NOT NULL,
+                        domain TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1,
+                        status TEXT NOT NULL DEFAULT 'proposed',
+                        definition_json TEXT NOT NULL, ratified_by TEXT,
+                        created_at REAL NOT NULL, updated_at REAL NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_doctrine_domain ON doctrine_registry(domain);
+                    CREATE INDEX IF NOT EXISTS idx_doctrine_status ON doctrine_registry(status);
+                    CREATE TABLE IF NOT EXISTS precedent_records (
+                        id TEXT PRIMARY KEY, precedent_type TEXT NOT NULL,
+                        subject_type TEXT NOT NULL, subject_id TEXT NOT NULL,
+                        decision_json TEXT NOT NULL,
+                        binding_strength REAL NOT NULL DEFAULT 0.5,
+                        source_review_id TEXT, created_at REAL NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_precedent_subject ON precedent_records(subject_type, subject_id);
+                    CREATE TABLE IF NOT EXISTS institutional_memory (
+                        id TEXT PRIMARY KEY, memory_type TEXT NOT NULL,
+                        scope_type TEXT NOT NULL, scope_id TEXT NOT NULL,
+                        content_json TEXT NOT NULL, lineage_json TEXT,
+                        confidence REAL NOT NULL DEFAULT 0.7,
+                        created_at REAL NOT NULL, updated_at REAL NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_inst_mem_type ON institutional_memory(memory_type);
+                    CREATE TABLE IF NOT EXISTS agent_clusters (
+                        id TEXT PRIMARY KEY, cluster_name TEXT NOT NULL,
+                        jurisdiction_json TEXT NOT NULL,
+                        authority_level TEXT NOT NULL DEFAULT 'operational',
+                        trust_score REAL NOT NULL DEFAULT 0.5,
+                        status TEXT NOT NULL DEFAULT 'active',
+                        created_at REAL NOT NULL, updated_at REAL NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS deliberation_sessions (
+                        id TEXT PRIMARY KEY, session_type TEXT NOT NULL,
+                        subject_type TEXT NOT NULL, subject_id TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'open',
+                        resolution_json TEXT,
+                        started_at REAL NOT NULL, completed_at REAL
+                    );
+                    CREATE TABLE IF NOT EXISTS deliberation_positions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_id TEXT NOT NULL,
+                        cluster_id TEXT NOT NULL,
+                        position_type TEXT NOT NULL,
+                        position_json TEXT NOT NULL,
+                        weight REAL NOT NULL DEFAULT 1.0,
+                        created_at REAL NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_delib_pos_session ON deliberation_positions(session_id);
+                    CREATE TABLE IF NOT EXISTS civilization_risks (
+                        id TEXT PRIMARY KEY, risk_type TEXT NOT NULL,
+                        severity TEXT NOT NULL DEFAULT 'medium',
+                        scope_json TEXT NOT NULL, evidence_json TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'detected',
+                        mitigation_json TEXT,
+                        created_at REAL NOT NULL, resolved_at REAL
+                    );
+                    CREATE TABLE IF NOT EXISTS cultural_drift_events (
+                        id TEXT PRIMARY KEY, drift_type TEXT NOT NULL,
+                        severity TEXT NOT NULL, signals_json TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'detected',
+                        detected_at REAL NOT NULL, resolved_at REAL
+                    );
+                """)
+                cursor.execute("UPDATE schema_version SET version = 11")
+                logger.info("Migrated state.db to schema v11 (AgentEOS v5 tables)")
+            if current_version < 12:
+                cursor.executescript("""
+                    CREATE TABLE IF NOT EXISTS epochs (
+                        id TEXT PRIMARY KEY, epoch_name TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'active', summary_json TEXT,
+                        started_at REAL NOT NULL, ended_at REAL, created_at REAL NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS continuity_proofs (
+                        id TEXT PRIMARY KEY, subject_type TEXT NOT NULL,
+                        subject_id TEXT NOT NULL, from_epoch_id TEXT, to_epoch_id TEXT,
+                        proof_json TEXT NOT NULL, continuity_score REAL NOT NULL DEFAULT 0.5,
+                        verdict TEXT NOT NULL, created_at REAL NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_cont_proof_subject ON continuity_proofs(subject_type, subject_id);
+                    CREATE TABLE IF NOT EXISTS civilization_migrations (
+                        id TEXT PRIMARY KEY, source_epoch_id TEXT NOT NULL,
+                        target_epoch_id TEXT, migration_type TEXT NOT NULL,
+                        plan_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'proposed',
+                        created_at REAL NOT NULL, started_at REAL, completed_at REAL
+                    );
+                    CREATE TABLE IF NOT EXISTS paradigm_shifts (
+                        id TEXT PRIMARY KEY, shift_type TEXT NOT NULL,
+                        description_json TEXT NOT NULL, severity TEXT NOT NULL DEFAULT 'medium',
+                        status TEXT NOT NULL DEFAULT 'detected', epoch_id TEXT,
+                        created_at REAL NOT NULL, resolved_at REAL
+                    );
+                    CREATE TABLE IF NOT EXISTS external_civilizations (
+                        id TEXT PRIMARY KEY, name TEXT NOT NULL,
+                        profile_json TEXT NOT NULL, trust_score REAL NOT NULL DEFAULT 0.5,
+                        risk_score REAL NOT NULL DEFAULT 0.5,
+                        status TEXT NOT NULL DEFAULT 'observed',
+                        created_at REAL NOT NULL, updated_at REAL NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS treaties (
+                        id TEXT PRIMARY KEY, external_civ_id TEXT NOT NULL,
+                        treaty_type TEXT NOT NULL, definition_json TEXT NOT NULL,
+                        risk_json TEXT, status TEXT NOT NULL DEFAULT 'proposed',
+                        created_at REAL NOT NULL, ratified_at REAL, terminated_at REAL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_treaty_civ ON treaties(external_civ_id);
+                    CREATE TABLE IF NOT EXISTS existential_events (
+                        id TEXT PRIMARY KEY, risk_type TEXT NOT NULL,
+                        severity TEXT NOT NULL, signals_json TEXT NOT NULL,
+                        response_json TEXT, status TEXT NOT NULL DEFAULT 'detected',
+                        detected_at REAL NOT NULL, resolved_at REAL
+                    );
+                    CREATE TABLE IF NOT EXISTS deep_time_memory (
+                        id TEXT PRIMARY KEY, memory_type TEXT NOT NULL, epoch_id TEXT,
+                        content_json TEXT NOT NULL, lineage_json TEXT,
+                        confidence REAL NOT NULL DEFAULT 0.7, created_at REAL NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_dtm_type ON deep_time_memory(memory_type);
+                    CREATE INDEX IF NOT EXISTS idx_dtm_epoch ON deep_time_memory(epoch_id);
+                    CREATE TABLE IF NOT EXISTS meta_senate_sessions (
+                        id TEXT PRIMARY KEY, session_type TEXT NOT NULL,
+                        subject_type TEXT NOT NULL, subject_id TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'open', resolution_json TEXT,
+                        started_at REAL NOT NULL, completed_at REAL
+                    );
+                    CREATE TABLE IF NOT EXISTS meta_senate_positions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_id TEXT NOT NULL, participant_id TEXT NOT NULL,
+                        position_type TEXT NOT NULL, position_json TEXT NOT NULL,
+                        weight REAL NOT NULL DEFAULT 1.0, created_at REAL NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_ms_pos_session ON meta_senate_positions(session_id);
+                """)
+                cursor.execute("UPDATE schema_version SET version = 12")
+                logger.info("Migrated state.db to schema v12 (AgentEOS v6 tables)")
+            if current_version < 13:
+                cursor.executescript("""
+                    CREATE TABLE IF NOT EXISTS evolution_units (
+                        id TEXT PRIMARY KEY, unit_type TEXT NOT NULL,
+                        layer TEXT NOT NULL, family TEXT NOT NULL,
+                        version TEXT NOT NULL DEFAULT '1.0',
+                        status TEXT NOT NULL DEFAULT 'candidate',
+                        definition_json TEXT NOT NULL, parent_unit_id TEXT,
+                        risk_level TEXT NOT NULL DEFAULT 'low',
+                        governance_scope TEXT NOT NULL DEFAULT 'auto',
+                        created_at REAL NOT NULL, updated_at REAL NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_eu_family ON evolution_units(family);
+                    CREATE INDEX IF NOT EXISTS idx_eu_status ON evolution_units(status);
+                    CREATE INDEX IF NOT EXISTS idx_eu_layer ON evolution_units(layer);
+                    CREATE TABLE IF NOT EXISTS evolution_mutations (
+                        id TEXT PRIMARY KEY,
+                        unit_id TEXT NOT NULL, mutation_type TEXT NOT NULL,
+                        mutation_json TEXT NOT NULL, created_at REAL NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS fitness_runs (
+                        id TEXT PRIMARY KEY, unit_id TEXT NOT NULL,
+                        fitness_type TEXT NOT NULL, metrics_json TEXT NOT NULL,
+                        weights_json TEXT NOT NULL, score REAL NOT NULL,
+                        window_start REAL NOT NULL, window_end REAL NOT NULL,
+                        created_at REAL NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_fit_unit ON fitness_runs(unit_id);
+                    CREATE TABLE IF NOT EXISTS selection_decisions (
+                        id TEXT PRIMARY KEY, unit_id TEXT NOT NULL,
+                        fitness_run_id TEXT, decision TEXT NOT NULL,
+                        decision_reason TEXT, created_at REAL NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS inheritance_links (
+                        id TEXT PRIMARY KEY, parent_unit_id TEXT NOT NULL,
+                        child_unit_id TEXT NOT NULL, inheritance_type TEXT NOT NULL,
+                        created_at REAL NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_inh_parent ON inheritance_links(parent_unit_id);
+                    CREATE INDEX IF NOT EXISTS idx_inh_child ON inheritance_links(child_unit_id);
+                    CREATE TABLE IF NOT EXISTS replicator_weights (
+                        id TEXT PRIMARY KEY, family TEXT NOT NULL,
+                        unit_id TEXT NOT NULL, weight REAL NOT NULL,
+                        window_label TEXT NOT NULL, created_at REAL NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_rep_family ON replicator_weights(family);
+                    CREATE TABLE IF NOT EXISTS evolution_experiments (
+                        id TEXT PRIMARY KEY, experiment_type TEXT NOT NULL,
+                        unit_id TEXT NOT NULL, baseline_unit_id TEXT,
+                        scope_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'created',
+                        metrics_json TEXT, started_at REAL NOT NULL, completed_at REAL
+                    );
+                """)
+                cursor.execute("UPDATE schema_version SET version = 13")
+                logger.info("Migrated state.db to schema v13 (Evolution Dynamics tables)")
+            if current_version < 14:
+                # v14: ED v1.1 — add columns to evolution_units + new tables
+                for col_name, col_type in [
+                    ("inheritance_mode", "TEXT"),
+                    ("transmission_mode", "TEXT"),
+                    ("stability_class", "TEXT"),
+                ]:
+                    try:
+                        safe = col_name.replace('"', '""')
+                        cursor.execute(f'ALTER TABLE evolution_units ADD COLUMN "{safe}" {col_type}')
+                    except sqlite3.OperationalError:
+                        pass
+                cursor.executescript("""
+                    CREATE TABLE IF NOT EXISTS epigenetic_markers (
+                        id TEXT PRIMARY KEY, unit_id TEXT NOT NULL,
+                        context_type TEXT NOT NULL,
+                        expression_weight REAL NOT NULL DEFAULT 1.0,
+                        activation_state TEXT NOT NULL DEFAULT 'neutral',
+                        reversible INTEGER NOT NULL DEFAULT 1,
+                        expires_at REAL, created_at REAL NOT NULL, updated_at REAL NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_epi_unit ON epigenetic_markers(unit_id);
+                    CREATE TABLE IF NOT EXISTS group_fitness_runs (
+                        id TEXT PRIMARY KEY, family TEXT NOT NULL,
+                        scope_type TEXT NOT NULL, scope_id TEXT NOT NULL,
+                        metrics_json TEXT NOT NULL, score REAL NOT NULL,
+                        window_start REAL NOT NULL, window_end REAL NOT NULL,
+                        created_at REAL NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_gfit_family ON group_fitness_runs(family);
+                    CREATE TABLE IF NOT EXISTS multilevel_selection_runs (
+                        id TEXT PRIMARY KEY, unit_id TEXT NOT NULL,
+                        individual_fitness_run_id TEXT NOT NULL,
+                        group_fitness_run_id TEXT NOT NULL,
+                        alpha REAL NOT NULL, total_score REAL NOT NULL,
+                        created_at REAL NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS criticality_snapshots (
+                        id TEXT PRIMARY KEY, scope_type TEXT NOT NULL,
+                        scope_id TEXT NOT NULL,
+                        cascade_frequency REAL NOT NULL DEFAULT 0.0,
+                        correlation_length REAL NOT NULL DEFAULT 0.0,
+                        distance_to_critical REAL NOT NULL DEFAULT 1.0,
+                        status TEXT NOT NULL DEFAULT 'stable',
+                        created_at REAL NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS gene_culture_transmissions (
+                        id TEXT PRIMARY KEY, unit_id TEXT NOT NULL,
+                        transmission_kind TEXT NOT NULL,
+                        source_scope TEXT NOT NULL, target_scope TEXT NOT NULL,
+                        decision TEXT NOT NULL, created_at REAL NOT NULL
+                    );
+                """)
+                cursor.execute("UPDATE schema_version SET version = 14")
+                logger.info("Migrated state.db to schema v14 (ED v1.1 tables)")
 
         # Unique title index — always ensure it exists (safe to run after migrations
         # since the title column is guaranteed to exist at this point)
@@ -1113,7 +2286,12 @@ class SessionDB:
             JOIN messages m ON m.id = messages_fts.rowid
             JOIN sessions s ON s.id = m.session_id
             WHERE {where_sql}
-            ORDER BY rank
+            ORDER BY
+                -- CMA temporal decay: blend FTS5 rank with recency
+                -- rank < 0 (more negative = better FTS match), so we negate it
+                -- decay = exp(-0.05 * days_old): half-life ~14 days
+                -- sessions < 3 days old get near-full weight; 30-day-old sessions ~22% weight
+                ((-rank) * exp(-0.05 * MAX(0, (unixepoch('now') - CAST(s.started_at AS REAL)) / 86400.0))) DESC
             LIMIT ? OFFSET ?
         """
 
