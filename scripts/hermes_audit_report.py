@@ -45,6 +45,30 @@ def _q(db: SessionDB, sql: str, params: tuple = ()) -> int:
         return 0
 
 
+_GATEWAY_OWN_CLUSTER = {
+    "main": "hermes-primary",
+    "ocean": "OCEAN",
+    "eleven": "ELEVEN",
+    "wilson": "WILSON",
+    "susan": "SUSAN",
+    "crypto": "CRYPTO",
+}
+
+
+def _self_trust(db: SessionDB, gateway: str) -> float:
+    name = _GATEWAY_OWN_CLUSTER.get(gateway)
+    if not name:
+        return 0.0
+    try:
+        row = db._conn.execute(
+            "SELECT trust_score FROM agent_clusters WHERE cluster_name=? AND status='active'",
+            (name,),
+        ).fetchone()
+        return round(float(row[0]), 3) if row and row[0] is not None else 0.0
+    except Exception:
+        return 0.0
+
+
 def collect(gateway: str, path: Path) -> dict:
     if not path.exists():
         return {"gateway": gateway, "present": False}
@@ -81,6 +105,9 @@ def collect(gateway: str, path: Path) -> dict:
             db, "SELECT COUNT(*) FROM policy_evaluations WHERE decision='allow_with_approval'"
         ),
         "clusters_active": _q(db, "SELECT COUNT(*) FROM agent_clusters WHERE status='active'"),
+        # Self-trust: this gateway's own cluster entry (hermes-primary in
+        # main, OCEAN/ELEVEN/WILSON/SUSAN/CRYPTO in the respective apostles)
+        "self_trust": _self_trust(db, gateway),
         "meta_runs": _q(db, "SELECT COUNT(*) FROM meta_learning_runs"),
         "meta_findings": _q(db, "SELECT COUNT(*) FROM meta_learning_findings"),
         "meta_finding_types": sorted(finding_types),
@@ -128,7 +155,8 @@ def format_text(snapshot: dict) -> str:
     header = (
         f"{'gateway':10s} {'sess':>5s} {'tasks':>6s} {'OK':>4s} {'FAIL':>5s} "
         f"{'stale':>5s} {'evid':>6s} {'named%':>7s} {'pol':>5s} {'!allow':>7s} "
-        f"{'runs':>5s} {'find':>5s} {'types':>5s} {'prop':>4s} {'capv_f':>6s} {'capv_b':>6s}"
+        f"{'runs':>5s} {'find':>5s} {'types':>5s} {'prop':>4s} {'capv_f':>6s} "
+        f"{'capv_b':>6s} {'trust':>6s}"
     )
     lines.append(header)
     lines.append("-" * len(header))
@@ -152,7 +180,8 @@ def format_text(snapshot: dict) -> str:
             f"{len(g['meta_finding_types']):>5d} "
             f"{g['proposals_total']:>4d} "
             f"{g['capability_versions_flow']:>6d} "
-            f"{g['capability_versions_bootstrap']:>6d}"
+            f"{g['capability_versions_bootstrap']:>6d} "
+            f"{g['self_trust']:>6.3f}"
         )
     lines.append("")
     lines.append("Legend:")
@@ -163,6 +192,7 @@ def format_text(snapshot: dict) -> str:
     lines.append("  prop         — total capability_proposals")
     lines.append("  capv_f       — capability_versions with source_proposal_id (Phase E flow)")
     lines.append("  capv_b       — capability_versions from brain-evolution bootstrap (static baseline)")
+    lines.append("  trust        — this gateway's own agent_clusters trust_score [0.1, 0.9]")
     return "\n".join(lines)
 
 

@@ -90,7 +90,10 @@ def apply_trust_update(
         return {"cluster": cluster_name, "found": False}
     rd = dict(row) if hasattr(row, "keys") else {"id": row[0], "trust_score": row[1]}
     current = float(rd["trust_score"])
-    new = max(MIN_TRUST, min(MAX_TRUST, current + delta))
+    # Keep trust scores at 3 decimal precision so the /tasks clusters
+    # output and governance_reviews notes read cleanly instead of showing
+    # floating-point artefacts like 0.6000000000000001.
+    new = round(max(MIN_TRUST, min(MAX_TRUST, current + delta)), 3)
     if new == current:
         return {"cluster": cluster_name, "id": rd["id"], "trust_before": current,
                 "trust_after": new, "delta": 0.0, "reason": reason, "applied": False}

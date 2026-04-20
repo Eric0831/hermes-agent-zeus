@@ -3238,6 +3238,42 @@ class GatewayRunner:
             from brain import task_store, evidence as brain_evidence
             db = self._session_db
 
+            # /tasks help — index of all subcommands
+            if args == "" or args == "help":
+                return (
+                    "**/tasks subcommands**\n"
+                    "\n"
+                    "_Observation_\n"
+                    "  `metrics`                     Brain KPIs for this session\n"
+                    "  `world`                       World-state summary\n"
+                    "  `clusters`                    Federation roster + trust_score\n"
+                    "  `governance [limit]`          Recent governance_reviews audit\n"
+                    "  `capabilities`                capability_versions status counts\n"
+                    "  `doctrines`                   Active routing / policy doctrines\n"
+                    "\n"
+                    "_Proposals_\n"
+                    "  `propose [family]`            Force-generate proposals now\n"
+                    "  `proposals [family] [status]` List proposals\n"
+                    "  `proposal <id>`               Proposal detail (suggestion + action_hint)\n"
+                    "  `approve <id>` / `reject <id> [reason]`\n"
+                    "  `incubate <id>`               approved → incubating + create version\n"
+                    "\n"
+                    "_Capability lifecycle_\n"
+                    "  `versions [status]`           List capability_versions\n"
+                    "  `experiment <vid>`            incubating → experimental\n"
+                    "  `execute <vid>`               Run the action_hint (10 kinds supported)\n"
+                    "  `rollout <vid>`               experimental → limited_rollout\n"
+                    "  `adopt <vid>`                 limited_rollout → adopted (atomic swap)\n"
+                    "  `deprecate <vid> [reason]`    any → deprecated\n"
+                    "\n"
+                    "_Evolution / reflection_\n"
+                    "  `evolve`                      Run meta_learning now\n"
+                    "  `proactive`                   Scan for proactive signals\n"
+                    "  `reflect [family]`            Recursive reflection\n"
+                    "\n"
+                    "See docs/PHASE_E_RUNBOOK.md for the full end-to-end workflow."
+                )
+
             # /tasks metrics — show brain KPIs
             if args == "metrics":
                 from brain.metrics import get_brain_metrics, format_metrics_text
