@@ -4980,9 +4980,20 @@ class AIAgent:
                 except Exception:
                     pass
 
+        # Sanitize surrogates from API response
+        _raw_content = assistant_message.content or ""
+        _san_content = _sanitize_surrogates(_raw_content)
+        if reasoning_text:
+            reasoning_text = _sanitize_surrogates(reasoning_text)
+
+        # Strip inline reasoning tags from stored assistant content.
+        # Reasoning already captured in reasoning_text, so raw tags are redundant.
+        if isinstance(_san_content, str) and _san_content:
+            _san_content = self._strip_think_blocks(_san_content).strip()
+
         msg = {
             "role": "assistant",
-            "content": assistant_message.content or "",
+            "content": _san_content,
             "reasoning": reasoning_text,
             "finish_reason": finish_reason,
         }
