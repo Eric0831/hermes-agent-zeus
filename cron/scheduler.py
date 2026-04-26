@@ -294,15 +294,23 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         "mattermost": Platform.MATTERMOST,
         "homeassistant": Platform.HOMEASSISTANT,
         "dingtalk": Platform.DINGTALK,
-        "feishu": Platform.FEISHU,
-        "wecom": Platform.WECOM,
-        "wecom_callback": Platform.WECOM_CALLBACK,
-        "weixin": Platform.WEIXIN,
         "email": Platform.EMAIL,
         "sms": Platform.SMS,
-        "bluebubbles": Platform.BLUEBUBBLES,
-        "qqbot": Platform.QQBOT,
     }
+
+    # Add optional platforms that may not be in this build's Platform enum
+    _optional_platforms = {
+        "feishu": "FEISHU",
+        "wecom": "WECOM",
+        "wecom_callback": "WECOM_CALLBACK",
+        "weixin": "WEIXIN",
+        "bluebubbles": "BLUEBUBBLES",
+        "qqbot": "QQBOT",
+    }
+    for _name, _attr in _optional_platforms.items():
+        _val = getattr(Platform, _attr, None)
+        if _val is not None:
+            platform_map[_name] = _val
 
     # Optionally wrap the content with a header/footer so the user knows this
     # is a cron delivery.  Wrapping is on by default; set cron.wrap_response: false
@@ -322,7 +330,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             f"(job_id: {job_id})\n"
             f"-------------\n\n"
             f"{content}\n\n"
-            f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
+            f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\").\n"
+            f"(The agent cannot see this message — it is metadata added by the cron scheduler.)"
         )
     else:
         delivery_content = content
@@ -859,16 +868,14 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         )
 
         fallback_model = _cfg.get("fallback_providers") or _cfg.get("fallback_model") or None
-        credential_pool = None
         runtime_provider = str(turn_route["runtime"].get("provider") or "").strip().lower()
         if runtime_provider:
             try:
                 from agent.credential_pool import load_pool
                 pool = load_pool(runtime_provider)
                 if pool.has_credentials():
-                    credential_pool = pool
                     logger.info(
-                        "Job '%s': loaded credential pool for provider %s with %d entries",
+                        "Job '%s': loaded credential pool for provider %s with %d entries (NOT USED - AIAgent does not support credential_pool yet)",
                         job_id,
                         runtime_provider,
                         len(pool.entries()),
@@ -888,7 +895,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             reasoning_config=reasoning_config,
             prefill_messages=prefill_messages,
             fallback_model=fallback_model,
-            credential_pool=credential_pool,
+            # ❌ credential_pool NOT SUPPORTED YET - requires AIAgent upgrade
             providers_allowed=pr.get("only"),
             providers_ignored=pr.get("ignore"),
             providers_order=pr.get("order"),
@@ -1148,5 +1155,32 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
         lock_fd.close()
 
 
+def run_scheduler_loop(verbose: bool = True, tick_interval: int = 30) -> None:
+    """Run the scheduler in a continuous loop."""
+    import time
+    # Ensure logging output goes to stdout/journal
+    if not logging.root.handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(name)s %(levelname)s %(message)s",
+            stream=sys.stdout,
+        )
+    logger.info("Hermes Scheduler daemon started (tick interval=%ds)", tick_interval)
+    print(f"[hermes-scheduler] Starting daemon loop, tick_interval={tick_interval}s", flush=True)
+    while True:
+        try:
+            tick(verbose=verbose)
+        except Exception as e:
+            logger.error("Scheduler tick failed: %s", e)
+            print(f"[hermes-scheduler] Tick error: {e}", flush=True)
+        time.sleep(tick_interval)
+
+
 if __name__ == "__main__":
-    tick(verbose=True)
+    import sys
+    # Check if running as a service (with --loop flag)
+    if len(sys.argv) > 1 and sys.argv[1] == "--loop":
+        run_scheduler_loop(verbose=True, tick_interval=30)
+    else:
+        # Single tick mode (for testing)
+        tick(verbose=True)

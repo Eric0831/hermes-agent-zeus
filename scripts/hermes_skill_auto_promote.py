@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Federation skill_registry auto-promotion.
 
-Finds skill_registry candidates that have been used enough times with
-high-enough success to be safely promoted to 'active', then calls
-brain.skill_engine.auto_promote (which also refuses high-risk
-candidates). Conservative gates so a lightly-used skill can't grab
-active status.
+Finds low-risk skill_registry candidates that have been used enough
+times with high-enough success to be safely promoted to 'active', then
+calls brain.skill_engine.auto_promote (which also refuses non-low-risk
+candidates). Conservative gates so a lightly-used or tool-risky skill
+can't grab active status.
 
 Default thresholds:
   min_usage     >= 5   (at least 5 recorded applications)
@@ -49,7 +49,7 @@ def candidates_ready(db: SessionDB, min_usage: int, min_success: float, cap: int
                   risk_level, source_task_id
            FROM skill_registry
            WHERE status = 'candidate'
-                 AND risk_level != 'high'
+                 AND risk_level = 'low'
                  AND usage_count >= ?
                  AND success_rate >= ?
            ORDER BY success_rate DESC, usage_count DESC

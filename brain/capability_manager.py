@@ -567,6 +567,8 @@ def _execute_extract_skill(
         if tn not in canonical_seq:
             canonical_seq.append(tn)
 
+    risk_level = _infer_extracted_skill_risk(tasks, core_tools)
+
     representative = tasks[0]
     rep_id = representative["id"] if hasattr(representative, "keys") else representative[0]
     rep_goal = representative["goal"] if hasattr(representative, "keys") else representative[2]
@@ -605,7 +607,7 @@ def _execute_extract_skill(
             (
                 sid, skill_name, f"{family}_auto", "1.0", "candidate",
                 json.dumps(definition, ensure_ascii=False),
-                1.0, 0, now, now, "low", rep_id,
+                1.0, 0, now, now, risk_level, rep_id,
             ),
         )
 
@@ -621,8 +623,45 @@ def _execute_extract_skill(
         "tasks_sampled": len(tasks),
         "tools": core_tools,
         "canonical_seq": canonical_seq,
+        "risk_level": risk_level,
         "representative_task_id": rep_id,
     }
+
+
+def _infer_extracted_skill_risk(tasks: list[Any], tools: list[str]) -> str:
+    """Infer candidate skill risk from sampled tasks and required tools."""
+    risk = "low"
+    for t in tasks:
+        if hasattr(t, "keys"):
+            risk = _max_risk(risk, str(t["risk_level"] or "low"))
+        else:
+            risk = _max_risk(risk, str(t[3] or "low"))
+    for tool_name in tools:
+        risk = _max_risk(risk, _tool_risk(tool_name))
+    return risk
+
+
+def _tool_risk(tool_name: str) -> str:
+    try:
+        from brain.policy import _get_tool_risk
+        return _get_tool_risk(tool_name)
+    except Exception:
+        medium = {
+            "terminal", "shell_exec_sandboxed", "process", "write_file",
+            "patch", "cronjob", "execute_code", "delegate_task",
+        }
+        high = {"send_message", "deploy", "agent_admin"}
+        if tool_name in high:
+            return "high"
+        if tool_name in medium:
+            return "medium"
+        return "low"
+
+
+def _max_risk(left: str, right: str) -> str:
+    levels = {"low": 0, "medium": 1, "high": 2}
+    reverse = {0: "low", 1: "medium", 2: "high"}
+    return reverse[max(levels.get(left, 0), levels.get(right, 0))]
 
 
 def _execute_extract_precedents(
@@ -646,9 +685,11 @@ def _execute_extract_precedents(
       3. binding_strength derived from evidence_count (capped at 0.9)
     """
     from brain import precedent_store
+    from brain.precedent_hygiene import is_clean_task_precedent
 
     family = action_hint.get("task_family") or version.get("capability_family", "").split(":", 1)[-1]
     limit = int(action_hint.get("limit", 10))
+    min_evidence = int(action_hint.get("min_evidence", 5))
 
     tasks = db._conn.execute(
         """SELECT id, task_type, goal, risk_level, verification_status,
@@ -657,7 +698,7 @@ def _execute_extract_precedents(
            WHERE status = 'completed' AND task_type = ?
                  AND verification_status = 'pass'
            ORDER BY completed_at DESC LIMIT ?""",
-        (family, limit),
+        (family, max(limit * 3, limit)),
     ).fetchall()
     if not tasks:
         return {
@@ -668,14 +709,26 @@ def _execute_extract_precedents(
         }
 
     created: list[str] = []
+    skipped: list[dict[str, str]] = []
     for t in tasks:
         td = dict(t) if hasattr(t, "keys") else {}
+        if len(created) >= limit:
+            break
         tid = td.get("id")
         goal = (td.get("goal") or "")[:250]
         evidence_count = db._conn.execute(
             "SELECT COUNT(*) FROM evidence_records WHERE task_id = ?",
             (tid,),
         ).fetchone()[0]
+        clean, reason = is_clean_task_precedent(
+            family=family,
+            goal=goal,
+            evidence_count=evidence_count,
+            min_evidence=min_evidence,
+        )
+        if not clean:
+            skipped.append({"task_id": str(tid), "reason": reason})
+            continue
         criteria_met = db._conn.execute(
             "SELECT COUNT(*) FROM task_criteria WHERE task_id = ? AND status = 'met'",
             (tid,),
@@ -711,7 +764,9 @@ def _execute_extract_precedents(
         "precedents_created": len(created),
         "family": family,
         "tasks_sampled": len(tasks),
+        "tasks_skipped": len(skipped),
         "precedent_ids": created[:3] + (["..."] if len(created) > 3 else []),
+        "skip_reasons": skipped[:3] + ([{"more": str(len(skipped) - 3)}] if len(skipped) > 3 else []),
     }
 
 

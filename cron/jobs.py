@@ -567,12 +567,18 @@ def remove_job(job_id: str) -> bool:
     return False
 
 
-def mark_job_run(job_id: str, success: bool, error: Optional[str] = None):
+def mark_job_run(job_id: str, success: bool, error: Optional[str] = None, delivery_error: Optional[str] = None):
     """
     Mark a job as having been run.
     
     Updates last_run_at, last_status, increments completed count,
     computes next_run_at, and auto-deletes if repeat limit reached.
+    
+    Args:
+        job_id: Job identifier
+        success: Whether the job completed successfully
+        error: Error message if job failed (optional)
+        delivery_error: Delivery error message if result delivery failed (optional)
     """
     jobs = load_jobs()
     for i, job in enumerate(jobs):
@@ -580,7 +586,8 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None):
             now = _hermes_now().isoformat()
             job["last_run_at"] = now
             job["last_status"] = "ok" if success else "error"
-            job["last_error"] = error if not success else None
+            # Prefer delivery_error if present, otherwise use error
+            job["last_error"] = delivery_error if (not success and delivery_error) else (error if not success else None)
             
             # Increment completed count
             if job.get("repeat"):

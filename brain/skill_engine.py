@@ -101,8 +101,9 @@ def auto_promote(db: Any, skill_id: str) -> bool:
     if not row or row["status"] != "candidate":
         return False
 
-    if row["risk_level"] == "high":
-        logger.debug("Skill %s is high-risk, requires manual review", skill_id)
+    if row["risk_level"] != "low":
+        logger.debug("Skill %s is %s-risk, requires manual review",
+                     skill_id, row["risk_level"])
         return False
 
     def _do(conn):

@@ -217,6 +217,24 @@ class TestSkillEngine:
         skill = get_skill(db, skill_id)
         assert skill["status"] == "active"
 
+    def test_auto_promote_rejects_medium_risk(self, db):
+        from brain.skill_engine import generate_candidate, auto_promote, get_skill
+
+        tid = _create_completed_task(db)
+        task = task_store.get_task(db, tid)
+        plan = json.loads(task["plan_json"])
+        ev = brain_evidence.get_evidence_for_task(tid, db)
+
+        skill_id = generate_candidate(db, task, plan, ev)
+        db._execute_write(lambda conn: conn.execute(
+            "UPDATE skill_registry SET risk_level = 'medium' WHERE id = ?",
+            (skill_id,),
+        ))
+
+        promoted = auto_promote(db, skill_id)
+        assert promoted is False
+        assert get_skill(db, skill_id)["status"] == "candidate"
+
     def test_search_skills(self, db):
         from brain.skill_engine import generate_candidate, auto_promote, search_skills
 

@@ -157,6 +157,49 @@ class TestCapabilityManager:
         assert stats.get("adopted", 0) == 1
         assert stats.get("proposed", 0) == 1
 
+    def test_extract_skill_infers_tool_risk(self, db):
+        from brain.capability_manager import create_version, execute_action
+
+        tid = task_store.create_task(db, "sess_v4", goal="Inspect runtime", task_type="general")
+        task_store.update_task_status(db, tid, "triaged")
+        task_store.update_task_status(
+            db,
+            tid,
+            "planned",
+            plan_json=json.dumps({
+                "goal": "Inspect runtime",
+                "success_criteria": ["checked"],
+                "subtasks": [],
+                "risks": [],
+            }),
+        )
+        task_store.update_task_status(db, tid, "running")
+        brain_evidence.capture_from_tool_result(tid, "terminal", "tc1", "ok", db)
+        brain_evidence.capture_from_tool_result(tid, "patch", "tc2", "ok", db)
+        task_store.update_task_status(db, tid, "verifying")
+        task_store.update_task_status(db, tid, "completed", verification_status="pass")
+
+        vid = create_version(db, "new_skill_family:general", {
+            "source": {
+                "action_hint": {
+                    "kind": "extract_skill",
+                    "task_family": "general",
+                    "skill_name": "general_runtime_path",
+                }
+            }
+        })
+        result = execute_action(db, vid)
+
+        assert result["executed"] is True
+        assert result["result"]["risk_level"] == "medium"
+        skill_id = result["result"]["skill_id"]
+        row = db._conn.execute(
+            "SELECT risk_level, status FROM skill_registry WHERE id = ?",
+            (skill_id,),
+        ).fetchone()
+        assert row["risk_level"] == "medium"
+        assert row["status"] == "candidate"
+
 
 # ══════════════════════════════════════════════════════════════════
 # Incubator Tests

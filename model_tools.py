@@ -375,6 +375,7 @@ def handle_function_call(
     enabled_tools: Optional[List[str]] = None,
     honcho_manager: Optional[Any] = None,
     honcho_session_key: Optional[str] = None,
+    session_db: Optional[Any] = None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -388,6 +389,8 @@ def handle_function_call(
                        execute_code uses this list to determine which sandbox
                        tools to generate.  Falls back to the process-global
                        ``_last_resolved_tool_names`` for backward compat.
+        session_db: Optional SessionDB to use for policy audit logging. When
+                    omitted, falls back to the default Hermes state DB.
 
     Returns:
         Function result as a JSON string.
@@ -418,8 +421,10 @@ def handle_function_call(
         # evidence before we flip the switch.
         try:
             from brain.policy import evaluate as _policy_evaluate
-            from hermes_state import SessionDB as _SessionDB
-            _policy_db = _SessionDB()
+            _policy_db = session_db
+            if _policy_db is None:
+                from hermes_state import SessionDB as _SessionDB
+                _policy_db = _SessionDB()
             _task_risk = "low"
             if task_id:
                 try:
@@ -435,6 +440,7 @@ def handle_function_call(
                 target=function_name,
                 task_id=task_id,
                 task_risk_level=_task_risk,
+                context={"args": function_args} if isinstance(function_args, dict) else None,
                 db=_policy_db,
             )
             if _pd.decision != "allow":

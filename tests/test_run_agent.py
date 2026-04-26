@@ -1250,6 +1250,7 @@ class TestConcurrentToolExecution:
                 enabled_tools=list(agent.valid_tool_names),
                 honcho_manager=None,
                 honcho_session_key=None,
+                session_db=None,
             )
             assert result == "result"
 
@@ -1259,6 +1260,39 @@ class TestConcurrentToolExecution:
             result = agent._invoke_tool("todo", {"todos": []}, "task-1")
             mock_todo.assert_called_once()
         assert "ok" in result
+
+    def test_agent_loop_policy_audit_uses_effective_task_id(self, agent, tmp_path):
+        """Agent-level tools bypass model_tools but still need policy linkage."""
+        from hermes_state import SessionDB
+        from brain import task_store
+
+        db = SessionDB(tmp_path / "agent_loop_policy.db")
+        db.create_session("sess_policy", "test")
+        task_id = task_store.create_task(
+            db,
+            "sess_policy",
+            goal="Delegate a coding task",
+            task_type="coding",
+            risk_level="medium",
+        )
+        agent._session_db = db
+
+        agent._audit_agent_loop_tool_policy(
+            "delegate_task",
+            {"goal": "run checks"},
+            task_id,
+        )
+
+        row = db._conn.execute(
+            """SELECT task_id, target, risk_level, decision
+               FROM policy_evaluations
+               ORDER BY created_at DESC
+               LIMIT 1"""
+        ).fetchone()
+        assert row is not None
+        assert row["task_id"] == task_id
+        assert row["target"] == "delegate_task"
+        assert row["risk_level"] == "medium"
 
 
 class TestPathsOverlap:

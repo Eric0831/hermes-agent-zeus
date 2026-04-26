@@ -101,6 +101,67 @@ class TestWorldState:
         assert len(summary) > 10
         assert "Active tasks" in summary or "Open loops" in summary or "Risk" in summary
 
+    def test_summary_includes_learned_context(self, db):
+        from brain.world_state import get_world_state_summary
+
+        def _seed(conn):
+            conn.execute(
+                """INSERT INTO skill_registry
+                   (id, skill_name, intent_family, version, status,
+                    definition_json, success_rate, usage_count, last_used_at,
+                    created_at, updated_at, risk_level, source_task_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    "skill_test_coding",
+                    "coding fast path",
+                    "coding_general",
+                    "1.0",
+                    "active",
+                    json.dumps({"tools": ["read_file", "terminal"]}),
+                    0.9,
+                    7,
+                    1.0,
+                    1.0,
+                    1.0,
+                    "low",
+                    None,
+                ),
+            )
+            conn.execute(
+                """INSERT INTO precedent_records
+                   (id, precedent_type, subject_type, subject_id, decision_json,
+                    binding_strength, source_review_id, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    "prec_test_coding",
+                    "family_pattern:coding",
+                    "task_family",
+                    "coding",
+                    json.dumps({
+                        "goal": "Fix login bug",
+                        "verification": "pass",
+                        "evidence_count": 6,
+                    }),
+                    0.8,
+                    None,
+                    1.0,
+                ),
+            )
+
+        db._execute_write(_seed)
+
+        summary = get_world_state_summary(
+            db,
+            "sess_p1",
+            goal="Fix login bug",
+            task_type="coding",
+        )
+        assert "Relevant learned context" in summary
+        assert "Reusable skills" in summary
+        assert "coding fast path" in summary
+        assert "Relevant precedents" in summary
+        assert "Fix login bug" in summary
+
     def test_none_db(self):
         from brain.world_state import get_world_state
         ws = get_world_state(None, "sess_none")
