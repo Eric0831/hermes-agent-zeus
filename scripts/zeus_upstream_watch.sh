@@ -1,16 +1,21 @@
 #!/usr/bin/env bash
 # ============================================================
-# ZEUS Upstream Watcher — 參考用，不再嘗試 sync
-# 用途：列出 upstream 最近的 commits 分類後讓人工 triage
-# 替代：scripts/zeus_upstream_sync.sh（已棄用，因 cherry-pick 全衝突）
+# ZEUS Upstream Watcher — 人工執行專用（read-only triage）
 # ============================================================
+#
+# ⚠️  此腳本必須【人工觸發】。禁止任何形式的自動化：
+#       - 禁止 cron / systemd timer / hook 自動 schedule
+#       - 禁止 cherry-pick / merge / rebase upstream 任何 commit
+#       - 報告產出後仍需人工 review，不會自動修改 ZEUS 任何代碼
+#     誤掛 timer 時，下方的 stdin TTY 檢查會在無人值守環境拒跑。
 #
 # 策略背景見 docs/FORK_STRATEGY.md
 #
-# 用法：
+# 用法（人工終端）：
 #   bash scripts/zeus_upstream_watch.sh            # 預設看最近 100 commits
 #   bash scripts/zeus_upstream_watch.sh 200        # 看最近 200 commits
 #   bash scripts/zeus_upstream_watch.sh > docs/upstream-watch-$(date +%Y-%m).md
+#   bash scripts/zeus_upstream_watch.sh --yes      # 略過確認（慎用，僅供已知環境）
 #
 # 輸出分類：
 #   🔒 SECURITY     — 含 security/CVE/sec 關鍵字
@@ -20,6 +25,19 @@
 #   ❓ OTHER        — 其他（refactor、merge 等）
 
 set +e
+
+# ---- manual-only guardrail ----
+# 拒絕無 TTY 的執行（cron / systemd timer 都會 fail），除非 --yes 旗標
+if [[ "${1:-}" == "--yes" ]]; then
+    shift
+elif [[ ! -t 0 ]]; then
+    echo "❌ ERROR: zeus_upstream_watch.sh 必須人工終端執行。" >&2
+    echo "   偵測不到 TTY (stdin 不是 tty)，可能是 cron/systemd timer/pipe 觸發。" >&2
+    echo "   策略：upstream 只做 read-only 參考，不允許自動化。" >&2
+    echo "   詳見 docs/FORK_STRATEGY.md" >&2
+    echo "   若確定要在 pipe / 重新導向情況下跑，加 --yes 旗標。" >&2
+    exit 2
+fi
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 LIMIT="${1:-100}"

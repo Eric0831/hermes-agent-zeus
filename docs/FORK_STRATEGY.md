@@ -27,21 +27,42 @@
 
 ## 工作流程
 
-### 月度 triage（建議第一個工作日）
-1. 跑 `bash scripts/zeus_upstream_watch.sh > docs/upstream-watch-YYYY-MM.md`
-   （此 script 只列分類過的 upstream changes，不嘗試 cherry-pick）
-2. 人工 review 報告，挑出值得 backport 的需求
-3. 對每個需求開 issue / task，由 ZEUS 架構視角設計實作
+> **🚨 全流程禁止自動化**：upstream 永遠是 read-only 參考。每一步都需人工
+> 確認後才執行。`zeus_upstream_watch.sh` 內建 TTY 檢查會拒絕在 cron / systemd
+> timer / pipe 環境執行（除非顯式 `--yes` 旗標）。
 
-### 緊急 backport（CVE / security）
+### 月度 triage（**建議**每月第一個工作日，**人工觸發**）
+**步驟 1 — 人工終端跑 watcher，產報告**
+```bash
+cd ~/.hermes/hermes-agent
+bash scripts/zeus_upstream_watch.sh > docs/upstream-watch-$(date +%Y-%m).md
+```
+
+**步驟 2 — 人工 review 報告**（不自動）
+- 看 🔒 SECURITY / ✨ FEAT / 🐛 FIX 三段
+- 對每個有興趣的 commit，**人工**判斷是否跟 ZEUS 相關
+
+**步驟 3 — 人工確認後**才能進入實作階段
+- 對 confirmed 的需求開 task / issue
+- **人工**讀 upstream 邏輯，**人工**設計 ZEUS-native 等價實作
+- **不可** cherry-pick / merge / rebase 任何 upstream commit
+
+### 緊急 backport（CVE / security）— 仍需人工
 1. 監控 https://github.com/NousResearch/hermes-agent/security/advisories
-2. 收到 advisory → 立即 review → 判斷是否影響 ZEUS 架構 → 如有，立即手寫 patch
+2. 收到 advisory → **人工** review → 判斷是否影響 ZEUS 架構 → 如有，**人工**手寫 patch
+3. 即使是 critical CVE，也不允許自動套用 upstream patch
 
-### Self-driven updates
-ZEUS 自己的 fixes/features 直接在主線開發，commit message 用 conventional commits：
+### Self-driven updates（ZEUS 自有開發）
+ZEUS 自己的 fixes/features 直接在主線開發，**人工** commit：
 - `feat(zeus): <description>` — 新功能
 - `fix(zeus): <description>` — 修補
 - `inspired-by: upstream:<sha>` — 提及上游靈感（選用）
+
+### 為什麼禁止自動化？
+1. **架構分歧大** — 1410 / 498 / 194 檔案差異，cherry-pick 必衝突
+2. **自動套會破** — 5/5 實測 upstream commits 全部 conflict 在 protected files
+3. **ZEUS 客製需要 context** — 機械化 sync 會破壞 brain/* 等模組的設計意圖
+4. **safety-by-design** — production 跑這份 working tree，無法承受意外改動
 
 ## Branch 結構（變更後）
 
