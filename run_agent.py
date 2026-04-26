@@ -1150,6 +1150,8 @@ class AIAgent:
         compression_threshold = float(_compression_cfg.get("threshold", 0.50))
         compression_enabled = str(_compression_cfg.get("enabled", True)).lower() in ("true", "1", "yes")
         compression_summary_model = _compression_cfg.get("summary_model") or None
+        compression_summary_base_url = _compression_cfg.get("summary_base_url") or ""
+        compression_summary_provider = _compression_cfg.get("summary_provider") or ""
         compression_target_ratio = float(_compression_cfg.get("target_ratio", 0.20))
         compression_protect_last = int(
             _compression_cfg.get(
@@ -1198,6 +1200,8 @@ class AIAgent:
             protect_last_n=compression_protect_last,
             summary_target_ratio=compression_target_ratio,
             summary_model_override=compression_summary_model,
+            summary_base_url=compression_summary_base_url,
+            summary_provider=compression_summary_provider,
             quiet_mode=self.quiet_mode,
             base_url=self.base_url,
             api_key=getattr(self, "api_key", ""),
@@ -2819,6 +2823,48 @@ class AIAgent:
                 len(missing_results),
             )
         return messages
+
+    @staticmethod
+    def _ensure_user_query_present(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        # Qwen3.5 chat template raises 'No user query found in messages.' when
+        # no role=user message exists, or when every user message is wrapped
+        # entirely in <tool_response>...</tool_response>. This typically
+        # happens after context compaction when the summary call failed and
+        # the compactor dropped the middle turns including the original user
+        # query. Inject a minimal placeholder user message right after the
+        # system prompt so the template renders without a 400.
+        if not messages:
+            return messages
+
+        def _qualifies(m: Dict[str, Any]) -> bool:
+            if m.get("role") != "user":
+                return False
+            content = m.get("content")
+            if isinstance(content, list):
+                text = "".join(
+                    str(item.get("text", "")) for item in content
+                    if isinstance(item, dict) and item.get("type") == "text"
+                )
+            else:
+                text = str(content or "")
+            text = text.strip()
+            if not text:
+                return False
+            return not (text.startswith("<tool_response>") and text.endswith("</tool_response>"))
+
+        if any(_qualifies(m) for m in messages):
+            return messages
+
+        insert_idx = 1 if messages[0].get("role") == "system" else 0
+        placeholder = {"role": "user", "content": "(Continue.)"}
+        logger.warning(
+            "Pre-call sanitizer: no qualifying user query found in %d messages "
+            "(roles=%s); injecting placeholder at index %d to satisfy chat template.",
+            len(messages),
+            [m.get("role") for m in messages],
+            insert_idx,
+        )
+        return messages[:insert_idx] + [placeholder] + messages[insert_idx:]
 
     @staticmethod
     def _cap_delegate_task_calls(tool_calls: list) -> list:
@@ -4980,8 +5026,6 @@ class AIAgent:
                 except Exception:
                     pass
 
-<<<<<<< HEAD
-=======
         # Sanitize surrogates from API response — some models (e.g. Kimi/GLM via Ollama)
         # can return invalid surrogate code points that crash json.dumps() on persist.
         _raw_content = assistant_message.content or ""
@@ -5003,7 +5047,6 @@ class AIAgent:
         if isinstance(_san_content, str) and _san_content:
             _san_content = self._strip_think_blocks(_san_content).strip()
 
->>>>>>> ec48ec55 (fix(agent): strip <think> blocks from stored assistant content)
         msg = {
             "role": "assistant",
             "content": assistant_message.content or "",
@@ -5424,6 +5467,7 @@ class AIAgent:
         its own inline invocation for backward-compatible display handling.
         """
         if function_name == "todo":
+            self._audit_agent_loop_tool_policy(function_name, function_args, effective_task_id)
             from tools.todo_tool import todo_tool as _todo_tool
             return _todo_tool(
                 todos=function_args.get("todos"),
@@ -5431,6 +5475,7 @@ class AIAgent:
                 store=self._todo_store,
             )
         elif function_name == "session_search":
+            self._audit_agent_loop_tool_policy(function_name, function_args, effective_task_id)
             if not self._session_db:
                 return json.dumps({"success": False, "error": "Session database not available."})
             from tools.session_search_tool import session_search as _session_search
@@ -5442,6 +5487,7 @@ class AIAgent:
                 current_session_id=self.session_id,
             )
         elif function_name == "memory":
+            self._audit_agent_loop_tool_policy(function_name, function_args, effective_task_id)
             target = function_args.get("target", "memory")
             from tools.memory_tool import memory_tool as _memory_tool
             result = _memory_tool(
@@ -5456,6 +5502,7 @@ class AIAgent:
                 self._honcho_save_user_observation(function_args.get("content", ""))
             return result
         elif function_name == "clarify":
+            self._audit_agent_loop_tool_policy(function_name, function_args, effective_task_id)
             from tools.clarify_tool import clarify_tool as _clarify_tool
             return _clarify_tool(
                 question=function_args.get("question", ""),
@@ -5463,6 +5510,7 @@ class AIAgent:
                 callback=self.clarify_callback,
             )
         elif function_name == "delegate_task":
+            self._audit_agent_loop_tool_policy(function_name, function_args, effective_task_id)
             from tools.delegate_tool import delegate_task as _delegate_task
             return _delegate_task(
                 goal=function_args.get("goal"),
@@ -5478,7 +5526,52 @@ class AIAgent:
                 enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
                 honcho_manager=self._honcho,
                 honcho_session_key=self._honcho_session_key,
+                session_db=self._session_db,
             )
+
+    def _audit_agent_loop_tool_policy(
+        self,
+        function_name: str,
+        function_args: dict,
+        effective_task_id: str,
+    ) -> None:
+        """Audit policy for tools handled inside AIAgent instead of model_tools."""
+        if not self._session_db:
+            return
+        try:
+            from brain.policy import evaluate as _policy_evaluate
+
+            task_risk = "low"
+            if effective_task_id:
+                try:
+                    row = self._session_db._conn.execute(
+                        "SELECT risk_level FROM tasks WHERE id = ?",
+                        (effective_task_id,),
+                    ).fetchone()
+                    if row:
+                        task_risk = row["risk_level"] if hasattr(row, "keys") else row[0]
+                except Exception:
+                    pass
+
+            decision = _policy_evaluate(
+                action_type="tool_call",
+                target=function_name,
+                task_id=effective_task_id,
+                task_risk_level=task_risk,
+                context={"args": function_args} if isinstance(function_args, dict) else None,
+                db=self._session_db,
+            )
+            if decision.decision != "allow":
+                logger.warning(
+                    "[Policy/audit] tool=%s task=%s decision=%s risk=%s reason=%s",
+                    function_name,
+                    effective_task_id or "-",
+                    decision.decision,
+                    decision.risk_level,
+                    decision.reason,
+                )
+        except Exception:
+            pass
 
     def _execute_tool_calls_concurrent(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
         """Execute multiple tool calls concurrently using a thread pool.
@@ -5648,6 +5741,7 @@ class AIAgent:
                 "role": "tool",
                 "content": function_result,
                 "tool_call_id": tc.id,
+                "tool_name": name,
             }
             messages.append(tool_msg)
 
@@ -5748,6 +5842,7 @@ class AIAgent:
             tool_start_time = time.time()
 
             if function_name == "todo":
+                self._audit_agent_loop_tool_policy(function_name, function_args, effective_task_id)
                 from tools.todo_tool import todo_tool as _todo_tool
                 function_result = _todo_tool(
                     todos=function_args.get("todos"),
@@ -5758,6 +5853,7 @@ class AIAgent:
                 if self.quiet_mode:
                     self._vprint(f"  {_get_cute_tool_message_impl('todo', function_args, tool_duration, result=function_result)}")
             elif function_name == "session_search":
+                self._audit_agent_loop_tool_policy(function_name, function_args, effective_task_id)
                 if not self._session_db:
                     function_result = json.dumps({"success": False, "error": "Session database not available."})
                 else:
@@ -5773,6 +5869,7 @@ class AIAgent:
                 if self.quiet_mode:
                     self._vprint(f"  {_get_cute_tool_message_impl('session_search', function_args, tool_duration, result=function_result)}")
             elif function_name == "memory":
+                self._audit_agent_loop_tool_policy(function_name, function_args, effective_task_id)
                 target = function_args.get("target", "memory")
                 from tools.memory_tool import memory_tool as _memory_tool
                 function_result = _memory_tool(
@@ -5789,6 +5886,7 @@ class AIAgent:
                 if self.quiet_mode:
                     self._vprint(f"  {_get_cute_tool_message_impl('memory', function_args, tool_duration, result=function_result)}")
             elif function_name == "clarify":
+                self._audit_agent_loop_tool_policy(function_name, function_args, effective_task_id)
                 from tools.clarify_tool import clarify_tool as _clarify_tool
                 function_result = _clarify_tool(
                     question=function_args.get("question", ""),
@@ -5799,6 +5897,7 @@ class AIAgent:
                 if self.quiet_mode:
                     self._vprint(f"  {_get_cute_tool_message_impl('clarify', function_args, tool_duration, result=function_result)}")
             elif function_name == "delegate_task":
+                self._audit_agent_loop_tool_policy(function_name, function_args, effective_task_id)
                 from tools.delegate_tool import delegate_task as _delegate_task
                 tasks_arg = function_args.get("tasks")
                 if tasks_arg and isinstance(tasks_arg, list):
@@ -5848,6 +5947,7 @@ class AIAgent:
                         enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
                         honcho_manager=self._honcho,
                         honcho_session_key=self._honcho_session_key,
+                        session_db=self._session_db,
                     )
                     _spinner_result = function_result
                 except Exception as tool_error:
@@ -5867,6 +5967,7 @@ class AIAgent:
                         enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
                         honcho_manager=self._honcho,
                         honcho_session_key=self._honcho_session_key,
+                        session_db=self._session_db,
                     )
                 except Exception as tool_error:
                     function_result = f"Error executing tool '{function_name}': {tool_error}"
@@ -5903,7 +6004,8 @@ class AIAgent:
             tool_msg = {
                 "role": "tool",
                 "content": function_result,
-                "tool_call_id": tool_call.id
+                "tool_call_id": tool_call.id,
+                "tool_name": function_name,
             }
             messages.append(tool_msg)
 
@@ -6562,6 +6664,7 @@ class AIAgent:
             # gated on context_compressor — so orphans from session loading or
             # manual message manipulation are always caught.
             api_messages = self._sanitize_api_messages(api_messages)
+            api_messages = self._ensure_user_query_present(api_messages)
 
             # Calculate approximate request size for logging
             total_chars = sum(len(str(msg)) for msg in api_messages)

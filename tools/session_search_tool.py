@@ -23,7 +23,10 @@ from typing import Dict, Any, List, Optional, Union
 
 from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
 MAX_SESSION_CHARS = 100_000
-MAX_SUMMARY_TOKENS = 10000
+# Was 10000 — combined with up to 6K-tokens of input prompt this exceeded
+# the 9B summarizer's 16K context window and caused 400s. 4K is plenty for
+# a focused recall summary and leaves comfortable headroom on a 16K model.
+MAX_SUMMARY_TOKENS = 4000
 
 
 def _format_timestamp(ts: Union[int, float, str, None]) -> str:

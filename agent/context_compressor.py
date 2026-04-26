@@ -68,6 +68,8 @@ class ContextCompressor:
         summary_target_ratio: float = 0.20,
         quiet_mode: bool = False,
         summary_model_override: str = None,
+        summary_base_url: str = "",
+        summary_provider: str = "",
         base_url: str = "",
         api_key: str = "",
         config_context_length: int | None = None,
@@ -77,6 +79,8 @@ class ContextCompressor:
         self.base_url = base_url
         self.api_key = api_key
         self.provider = provider
+        self.summary_base_url = summary_base_url
+        self.summary_provider = summary_provider
         self.threshold_percent = threshold_percent
         self.protect_first_n = protect_first_n
         self.protect_last_n = protect_last_n
@@ -91,11 +95,29 @@ class ContextCompressor:
         self.threshold_tokens = int(self.context_length * threshold_percent)
         self.compression_count = 0
 
+        # Resolve the summary model's own context window. When summary runs
+        # on a smaller cheap model (e.g. 9B with 16K) than the main model
+        # (e.g. 27B with 98K), sizing the budget against self.context_length
+        # blows past the summarizer's max_model_len and causes 400s. Use the
+        # smaller of the two so output budget never exceeds what the
+        # summarizer can actually accept.
+        if summary_model_override and summary_model_override != model:
+            self.summary_context_length = get_model_context_length(
+                summary_model_override,
+                base_url=summary_base_url or base_url,
+                api_key=api_key,
+                provider=summary_provider or provider,
+            )
+        else:
+            self.summary_context_length = self.context_length
+
         # Derive token budgets: ratio is relative to the threshold, not total context
         target_tokens = int(self.threshold_tokens * self.summary_target_ratio)
         self.tail_token_budget = target_tokens
+        # Cap output budget against the *summary* model's context, not the
+        # main model's, to prevent input+output overflow on cheap summarizers.
         self.max_summary_tokens = min(
-            int(self.context_length * 0.05), _SUMMARY_TOKENS_CEILING,
+            int(self.summary_context_length * 0.05), _SUMMARY_TOKENS_CEILING,
         )
 
         if not quiet_mode:
@@ -247,23 +269,10 @@ class ContextCompressor:
 
         return "\n\n".join(parts)
 
-    def _generate_summary(self, turns_to_summarize: List[Dict[str, Any]]) -> Optional[str]:
-        """Generate a structured summary of conversation turns.
-
-        Uses a structured template (Goal, Progress, Decisions, Files, Next Steps)
-        inspired by Pi-mono and OpenCode. When a previous summary exists,
-        generates an iterative update instead of summarizing from scratch.
-
-        Returns None if all attempts fail — the caller should drop
-        the middle turns without a summary rather than inject a useless
-        placeholder.
-        """
-        summary_budget = self._compute_summary_budget(turns_to_summarize)
-        content_to_summarize = self._serialize_for_summary(turns_to_summarize)
-
+    def _build_summary_prompt(self, content_to_summarize: str, summary_budget: int) -> str:
+        """Build the summary prompt for either iterative or first compaction."""
         if self._previous_summary:
-            # Iterative update: preserve existing info, add new progress
-            prompt = f"""You are updating a context compaction summary. A previous compaction produced the summary below. New conversation turns have occurred since then and need to be incorporated.
+            return f"""You are updating a context compaction summary. A previous compaction produced the summary below. New conversation turns have occurred since then and need to be incorporated.
 
 PREVIOUS SUMMARY:
 {self._previous_summary}
@@ -302,9 +311,7 @@ Update the summary using this exact structure. PRESERVE all existing information
 Target ~{summary_budget} tokens. Be specific — include file paths, command outputs, error messages, and concrete values rather than vague descriptions.
 
 Write only the summary body. Do not include any preamble or prefix."""
-        else:
-            # First compaction: summarize from scratch
-            prompt = f"""Create a structured handoff summary for a later assistant that will continue this conversation after earlier turns are compacted.
+        return f"""Create a structured handoff summary for a later assistant that will continue this conversation after earlier turns are compacted.
 
 TURNS TO SUMMARIZE:
 {content_to_summarize}
@@ -341,16 +348,85 @@ Target ~{summary_budget} tokens. Be specific — include file paths, command out
 
 Write only the summary body. Do not include any preamble or prefix."""
 
+    def _generate_summary(self, turns_to_summarize: List[Dict[str, Any]]) -> Optional[str]:
+        """Generate a structured summary of conversation turns.
+
+        Uses a structured template (Goal, Progress, Decisions, Files, Next Steps)
+        inspired by Pi-mono and OpenCode. When a previous summary exists,
+        generates an iterative update instead of summarizing from scratch.
+
+        Returns None if all attempts fail — the caller should drop
+        the middle turns without a summary rather than inject a useless
+        placeholder.
+        """
+        summary_budget = self._compute_summary_budget(turns_to_summarize)
+        content_to_summarize = self._serialize_for_summary(turns_to_summarize)
+        prompt = self._build_summary_prompt(content_to_summarize, summary_budget)
+
+        # Size output budget so prompt + output fits the summarizer's context.
+        # Reserve a small safety margin for chat-template + role tokens.
+        _SAFETY = 256
+        prompt_tokens_est = estimate_messages_tokens_rough(
+            [{"role": "user", "content": prompt}]
+        )
+        available_output = self.summary_context_length - prompt_tokens_est - _SAFETY
+
+        # If the prompt doesn't leave room for at least the minimum summary
+        # output, truncate the serialized turns (head + tail) and rebuild.
+        if available_output < _MIN_SUMMARY_TOKENS and len(content_to_summarize) > 4000:
+            output_reserve = max(_MIN_SUMMARY_TOKENS, summary_budget * 2)
+            keep_input_tokens = max(
+                _MIN_SUMMARY_TOKENS,
+                self.summary_context_length - _SAFETY - output_reserve - 1024,
+            )
+            keep_chars = max(2000, keep_input_tokens * 4)
+            head_chars = int(keep_chars * 0.4)
+            tail_chars = keep_chars - head_chars
+            content_to_summarize = (
+                content_to_summarize[:head_chars]
+                + "\n\n...[older turns truncated to fit summarizer context]...\n\n"
+                + content_to_summarize[-tail_chars:]
+            )
+            prompt = self._build_summary_prompt(content_to_summarize, summary_budget)
+            prompt_tokens_est = estimate_messages_tokens_rough(
+                [{"role": "user", "content": prompt}]
+            )
+            available_output = self.summary_context_length - prompt_tokens_est - _SAFETY
+            logging.info(
+                "Context compression: truncated input to fit summarizer "
+                "(ctx=%d, prompt~%d, output_avail=%d).",
+                self.summary_context_length, prompt_tokens_est, available_output,
+            )
+
+        # Final clamp: never request more output than the summarizer can produce.
+        max_tokens = min(summary_budget * 2, max(_MIN_SUMMARY_TOKENS, available_output))
+        if max_tokens < _MIN_SUMMARY_TOKENS:
+            logging.warning(
+                "Context compression: prompt too large for summarizer "
+                "(prompt~%d tokens, ctx=%d). Skipping summary.",
+                prompt_tokens_est, self.summary_context_length,
+            )
+            return None
+
         try:
             call_kwargs = {
                 "task": "compression",
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.3,
-                "max_tokens": summary_budget * 2,
+                "max_tokens": max_tokens,
                 # timeout resolved from auxiliary.compression.timeout config by call_llm
             }
             if self.summary_model:
                 call_kwargs["model"] = self.summary_model
+                # Pin the endpoint to summary_base_url so the explicit
+                # summary_model name reaches the matching server, instead
+                # of being routed via auxiliary.compression.base_url which
+                # may point at a different vLLM instance (and 404).
+                if self.summary_base_url:
+                    call_kwargs["base_url"] = self.summary_base_url
+                    call_kwargs["api_key"] = self.api_key
+                if self.summary_provider:
+                    call_kwargs["provider"] = self.summary_provider
             response = call_llm(**call_kwargs)
             content = response.choices[0].message.content
             # Handle cases where content is not a string (e.g., dict from llama.cpp)
@@ -610,6 +686,25 @@ Write only the summary body. Do not include any preamble or prefix."""
 
         # Phase 3: Generate structured summary
         summary = self._generate_summary(turns_to_summarize)
+
+        # If summary generation failed AND dropping the middle would leave
+        # zero user-role messages, abort compaction. Otherwise the
+        # downstream chat template (e.g. Qwen3.5) raises 'No user query
+        # found in messages.' on the next API call.
+        if not summary:
+            head_has_user = any(
+                m.get("role") == "user" for m in messages[:compress_start]
+            )
+            tail_has_user = any(
+                m.get("role") == "user" for m in messages[compress_end:]
+            )
+            if not (head_has_user or tail_has_user):
+                logger.warning(
+                    "Compression aborted: summary unavailable and dropping "
+                    "middle turns would leave no user message. Returning "
+                    "original messages."
+                )
+                return messages
 
         # Phase 4: Assemble compressed message list
         compressed = []

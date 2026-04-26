@@ -76,6 +76,66 @@ def _write_json(path: Path, data: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# SQLite schema bootstrap — idempotent
+# ---------------------------------------------------------------------------
+
+_V2_SCHEMA_INIT_DONE: set = set()
+
+
+def _ensure_v2_schema(db: sqlite3.Connection) -> None:
+    """Create V2 memory tables if they don't exist.
+
+    The persist/search code paths historically assumed schema was created
+    elsewhere; in practice no migration ever ran, so session_summaries,
+    archival_chunks, and their FTS shadows were missing. This causes
+    persist_session_summary to fail silently and recall to return empty.
+    Idempotent — safe to call on every connection.
+    """
+    db_id = id(db)
+    if db_id in _V2_SCHEMA_INIT_DONE:
+        return
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS session_summaries (
+            session_id TEXT PRIMARY KEY,
+            agent_id   TEXT NOT NULL,
+            topic      TEXT,
+            summary    TEXT,
+            outcome    TEXT,
+            open_loops_json TEXT,
+            files_json TEXT,
+            tags_json  TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_session_summaries_agent
+            ON session_summaries(agent_id, created_at DESC);
+        CREATE VIRTUAL TABLE IF NOT EXISTS session_summaries_fts USING fts5(
+            session_id UNINDEXED,
+            agent_id   UNINDEXED,
+            summary,
+            tokenize='unicode61'
+        );
+
+        CREATE TABLE IF NOT EXISTS archival_chunks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            agent_id   TEXT,
+            chunk_text TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_archival_chunks_session
+            ON archival_chunks(session_id);
+        CREATE VIRTUAL TABLE IF NOT EXISTS archival_chunks_fts USING fts5(
+            chunk_text,
+            content='archival_chunks',
+            content_rowid='id',
+            tokenize='unicode61'
+        );
+    """)
+    db.commit()
+    _V2_SCHEMA_INIT_DONE.add(db_id)
+
+
+# ---------------------------------------------------------------------------
 # L1: Core Memory — read
 # ---------------------------------------------------------------------------
 
@@ -194,6 +254,7 @@ def persist_session_summary(
     # Write SQLite
     try:
         db = sqlite3.connect(str(_db_path()))
+        _ensure_v2_schema(db)
         db.execute("""
             INSERT OR REPLACE INTO session_summaries
             (session_id, agent_id, topic, summary, outcome,
@@ -254,6 +315,7 @@ def _search_session_summaries(query: str, agent_id: str = "") -> Optional[str]:
     """FTS search over session_summaries. Returns best match text."""
     try:
         db = sqlite3.connect(str(_db_path()))
+        _ensure_v2_schema(db)
         rows = db.execute("""
             SELECT s.session_id, s.topic, s.summary, s.created_at
             FROM session_summaries_fts f
@@ -299,6 +361,7 @@ def _search_archival_chunks(query: str, agent_id: str = "") -> Optional[str]:
     """FTS search over archival_chunks. Returns best match text."""
     try:
         db = sqlite3.connect(str(_db_path()))
+        _ensure_v2_schema(db)
         rows = db.execute("""
             SELECT c.session_id, c.chunk_text, c.created_at
             FROM archival_chunks_fts f

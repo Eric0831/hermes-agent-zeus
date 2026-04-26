@@ -3249,6 +3249,9 @@ class GatewayRunner:
                     "  `clusters`                    Federation roster + trust_score\n"
                     "  `governance [limit]`          Recent governance_reviews audit\n"
                     "  `capabilities`                capability_versions status counts\n"
+                    "  `loop`                        Closed-loop controller status\n"
+                    "  `hygiene`                     Precedent hygiene filter report\n"
+                    "  `policy`                      Policy boundary and risk coverage\n"
                     "  `doctrines`                   Active routing / policy doctrines\n"
                     "\n"
                     "_Proposals_\n"
@@ -3686,6 +3689,30 @@ class GatewayRunner:
                 except Exception as e:
                     return f"Capability listing failed: {e}"
 
+            # /tasks loop — closed-loop controller status
+            if args == "loop":
+                try:
+                    from brain.closed_loop_status import collect_status, format_status
+                    return format_status(collect_status(db))
+                except Exception as e:
+                    return f"Closed-loop status failed: {e}"
+
+            # /tasks hygiene — precedent hygiene filter report
+            if args == "hygiene":
+                try:
+                    from brain.precedent_hygiene_status import collect_status, format_status
+                    return format_status(collect_status(db))
+                except Exception as e:
+                    return f"Precedent hygiene status failed: {e}"
+
+            # /tasks policy — policy boundary and risk coverage
+            if args == "policy":
+                try:
+                    from brain.policy_status import collect_status, format_status
+                    return format_status(collect_status(db))
+                except Exception as e:
+                    return f"Policy status failed: {e}"
+
             # /tasks reflect [family] — recursive reflection
             if args.startswith("reflect"):
                 try:
@@ -3990,6 +4017,7 @@ class GatewayRunner:
                 session_id=session_entry.session_id,
                 session_key=session_key,
                 event_message_id=getattr(event, 'message_id', None),
+                tool_task_id=task_id,
             )
 
             # Capture evidence (shared helper resolves tool_name via tool_call_id)
@@ -6058,7 +6086,12 @@ class GatewayRunner:
         # avoid duplicating work already in flight.
         try:
             from brain.world_state import get_world_state_summary
-            world_context = get_world_state_summary(db, session_id)
+            world_context = get_world_state_summary(
+                db,
+                session_id,
+                goal=message_text,
+                task_type=triage_result.task_type,
+            )
         except Exception as _ws_exc:
             logger.debug("[Brain] world_state summary unavailable: %s", _ws_exc)
             world_context = ""
@@ -6099,6 +6132,7 @@ class GatewayRunner:
             session_id=session_id,
             session_key=session_key,
             event_message_id=getattr(event, 'message_id', None),
+            tool_task_id=task_id,
         )
 
         # 5. Capture evidence from tool calls (shared helper resolves
@@ -6156,6 +6190,7 @@ class GatewayRunner:
                     session_id=session_id,
                     session_key=session_key,
                     event_message_id=getattr(event, 'message_id', None),
+                    tool_task_id=task_id,
                 )
 
                 # Capture retry evidence (shared helper)
@@ -6318,6 +6353,7 @@ class GatewayRunner:
         session_key: str = None,
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
+        tool_task_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -6770,7 +6806,11 @@ class GatewayRunner:
                             if _p:
                                 _history_media_paths.add(_p)
             
-            result = agent.run_conversation(message, conversation_history=agent_history, task_id=session_id)
+            result = agent.run_conversation(
+                message,
+                conversation_history=agent_history,
+                task_id=tool_task_id or session_id,
+            )
             result_holder[0] = result
 
             # Signal the stream consumer that the agent is done

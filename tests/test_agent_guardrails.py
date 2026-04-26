@@ -108,6 +108,72 @@ class TestSanitizeApiMessages:
 
 
 # ---------------------------------------------------------------------------
+# Phase 1b — _ensure_user_query_present
+# ---------------------------------------------------------------------------
+
+class TestEnsureUserQueryPresent:
+
+    def test_empty_list_unchanged(self):
+        assert AIAgent._ensure_user_query_present([]) == []
+
+    def test_existing_user_message_unchanged(self):
+        msgs = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "ok"},
+        ]
+        assert AIAgent._ensure_user_query_present(msgs) == msgs
+
+    def test_no_user_after_system_injects_placeholder(self):
+        msgs = [
+            {"role": "system", "content": "sys"},
+            {"role": "assistant", "content": "stale"},
+            {"role": "tool", "content": "out", "tool_call_id": "c1"},
+        ]
+        out = AIAgent._ensure_user_query_present(msgs)
+        assert len(out) == 4
+        assert out[0]["role"] == "system"
+        assert out[1]["role"] == "user"
+        assert out[1]["content"]
+        assert out[2]["role"] == "assistant"
+
+    def test_no_system_injects_at_index_0(self):
+        msgs = [
+            {"role": "assistant", "content": "stale"},
+        ]
+        out = AIAgent._ensure_user_query_present(msgs)
+        assert out[0]["role"] == "user"
+        assert out[1]["role"] == "assistant"
+
+    def test_only_tool_response_user_messages_inject(self):
+        msgs = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "<tool_response>\nok\n</tool_response>"},
+        ]
+        out = AIAgent._ensure_user_query_present(msgs)
+        assert len(out) == 3
+        assert out[1]["role"] == "user"
+        assert "<tool_response>" not in out[1]["content"]
+
+    def test_list_form_text_content_qualifies(self):
+        msgs = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": [{"type": "text", "text": "real"}]},
+        ]
+        assert AIAgent._ensure_user_query_present(msgs) == msgs
+
+    def test_empty_user_content_does_not_qualify(self):
+        msgs = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "   "},
+        ]
+        out = AIAgent._ensure_user_query_present(msgs)
+        assert len(out) == 3
+        assert out[1]["role"] == "user"
+        assert out[1]["content"].strip()
+
+
+# ---------------------------------------------------------------------------
 # Phase 2a — _cap_delegate_task_calls
 # ---------------------------------------------------------------------------
 
