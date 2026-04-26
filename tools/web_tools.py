@@ -205,6 +205,57 @@ def _normalize_tavily_search_results(response: dict) -> dict:
     return {"success": True, "data": {"web": web_results}}
 
 
+def _httpx_extract_fallback(urls: List[str]) -> List[Dict[str, Any]]:
+    """Direct fetch + readable text extraction when Tavily quota is exhausted.
+
+    Uses httpx + a minimal readability heuristic (strip script/style, keep
+    text). Returns the same document shape as ``_normalize_tavily_documents``
+    so downstream consumers can't tell it's a fallback.
+    """
+    import re as _re
+    try:
+        import httpx
+    except ImportError:
+        # No fallback library available
+        return [{
+            "url": u, "title": "",
+            "error": "tavily_quota_exhausted_and_no_httpx_fallback",
+            "metadata": {"sourceURL": u},
+        } for u in urls]
+
+    documents: List[Dict[str, Any]] = []
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; ZEUS-extract/1.0)"}
+    for url in urls:
+        try:
+            with httpx.Client(timeout=15.0, follow_redirects=True, headers=headers) as client:
+                r = client.get(url)
+                r.raise_for_status()
+                html = r.text
+            # Strip <script>, <style>, then collapse tags to whitespace
+            stripped = _re.sub(r"<script[^>]*>.*?</script>", " ", html, flags=_re.DOTALL | _re.IGNORECASE)
+            stripped = _re.sub(r"<style[^>]*>.*?</style>", " ", stripped, flags=_re.DOTALL | _re.IGNORECASE)
+            text = _re.sub(r"<[^>]+>", " ", stripped)
+            text = _re.sub(r"\s+", " ", text).strip()
+            title_match = _re.search(r"<title[^>]*>(.*?)</title>", html, flags=_re.IGNORECASE | _re.DOTALL)
+            title = title_match.group(1).strip() if title_match else ""
+            # Truncate aggressively to keep payload reasonable
+            content = text[:8000]
+            documents.append({
+                "url": url,
+                "title": title,
+                "content": content,
+                "raw_content": content,
+                "metadata": {"sourceURL": url, "backend": "httpx_fallback"},
+            })
+        except Exception as e:
+            documents.append({
+                "url": url, "title": "",
+                "error": f"httpx_fallback_failed: {type(e).__name__}: {str(e)[:120]}",
+                "metadata": {"sourceURL": url, "backend": "httpx_fallback"},
+            })
+    return documents
+
+
 def _ddg_fallback_search(query: str, limit: int) -> dict:
     """Run a DuckDuckGo text search and return results in the standard
     web_search payload shape so callers can't tell it wasn't Tavily.
@@ -1073,11 +1124,22 @@ async def web_extract_tool(
                 results = _exa_extract(safe_urls)
             elif backend == "tavily":
                 logger.info("Tavily extract: %d URL(s)", len(safe_urls))
-                raw = _tavily_request("extract", {
-                    "urls": safe_urls,
-                    "include_images": False,
-                })
-                results = _normalize_tavily_documents(raw, fallback_url=safe_urls[0] if safe_urls else "")
+                try:
+                    raw = _tavily_request("extract", {
+                        "urls": safe_urls,
+                        "include_images": False,
+                    })
+                    results = _normalize_tavily_documents(raw, fallback_url=safe_urls[0] if safe_urls else "")
+                except Exception as tavily_err:
+                    msg = str(tavily_err)
+                    if "432" in msg or "usage limit" in msg.lower() or "quota" in msg.lower():
+                        logger.warning(
+                            "Tavily quota exhausted on extract — transparent fallback to httpx for %d URL(s)",
+                            len(safe_urls),
+                        )
+                        results = _httpx_extract_fallback(safe_urls)
+                    else:
+                        raise
             else:
                 # ── Firecrawl extraction ──
                 # Determine requested formats for Firecrawl v2
