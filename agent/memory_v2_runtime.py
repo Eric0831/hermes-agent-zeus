@@ -390,6 +390,22 @@ def build_memory_v2_prompt(session_id: str, user_message: str = "") -> str:
     """
     parts: List[str] = []
 
+    # Freshness header — agents tend to treat memory entries as evergreen
+    # facts. Pinning the build timestamp + a "verify before stating as
+    # current" rule reduces stale-status replies (TG kept reporting old
+    # state because LLM repeated facts from compacted context instead of
+    # calling tools to refresh).
+    _now_local = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z")
+    parts.append(
+        f"══ Memory snapshot built at {_now_local} ══\n"
+        "FRESHNESS RULE — for any user query about CURRENT state "
+        "(running/active/now/最新/現在/狀態/進度/是否在跑), do NOT answer "
+        "from this memory or earlier conversation. Call the relevant live "
+        "tool (terminal/process/session_search/mcp_zeus_get_agent_status/"
+        "read_file) to fetch real-time data. Memory below is point-in-time "
+        "context, not a live system state."
+    )
+
     # L1: Core Memory
     user_facts = _extract_fact_lines(_load_core_user_memory())
     agent_facts = _extract_fact_lines(_load_agent_core_memory())
