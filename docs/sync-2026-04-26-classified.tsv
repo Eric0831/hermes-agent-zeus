@@ -1,0 +1,100 @@
+SKIP|59b56d44|feat(hooks): add duration_ms to post_tool_call + transform_tool_result (#15429)
+OTHER|eb28145f|feat(approval): hardline blocklist for unrecoverable commands (#15878)
+OTHER|a55de5bc|feat(setup): auto-reconfigure on existing installs (#15879)
+OTHER|cec0af02|Merge pull request #15870 from NousResearch/bb/fix-skills-search
+REVIEW|91a7a0ac|fix(tui): restore skills search RPC
+REVIEW|7c50ed70|docs(azure-foundry): add provider guide, env vars, release AUTHOR_MAP
+OTHER|731e1ef8|feat(azure-foundry): auto-detect transport, models, context length
+SKIP|ac571142|fix(agent): support Azure OpenAI gpt-5.x on chat/completions endpoint
+SKIP|24b4b24d|fix: preserve URL query params for Azure OpenAI and custom endpoints
+REVIEW|c15064fa|fix: pass api-version as default_query param, not in base_url — SDK was producing malformed URLs like /anthropic?api-version=.../v1/messages
+SKIP|7bfa9442|fix: skip OAuth token refresh for Azure Anthropic endpoints — prevents ~/.claude/.credentials.json from overwriting Azure key mid-session
+REVIEW|d8e4c721|fix: Azure Anthropic short-circuit in resolve_runtime_provider — bypass custom runtime when provider=anthropic + azure.com URL
+REVIEW|6ef3a47c|fix: use Azure API key directly for Azure endpoints, bypass OAuth token priority chain
+SKIP|3a7653dd|feat: Add Azure Foundry provider with OpenAI/Anthropic API mode selection
+SKIP|125de020|fix(context): honor custom_providers context_length on /model switch + bump probe tier to 256K (#15844)
+REVIEW|4c591c28|chore(release): map fqsy1416@gmail.com to EKKOLearnAI
+REVIEW|01535a47|fix(api_server): cap stop-run wait at 5s so interrupt can't hang handler
+OTHER|0a15dbdc|feat(api_server): add POST /v1/runs/{run_id}/stop endpoint
+REVIEW|ce0513dd|chore(release): map Feranmi10 personal email
+OTHER|dc5e02ea|feat(cli): implement hermes update --check flag (fixes #10318)
+OTHER|ff851ba7|Merge pull request #15821 from NousResearch/fix/tui-ctrl-g-editor
+REVIEW|14dd8e9a|fix(tui): address Copilot review on editor handoff
+SAFE|1d80e92c|test(discord): add guild to fake e2e messages
+REVIEW|edce7522|chore(release): add AUTHOR_MAP entry for voidborne-d personal email
+REVIEW|45e1228a|fix(cli): suppress OSError EIO on interrupt shutdown
+OTHER|83129e72|refactor(tui): tighten editor handoff helpers
+REVIEW|4d170134|chore(release): map nerijusn76@gmail.com to Nerijusas (#15833)
+SKIP|81e01f6e|fix(agent): preserve Codex message items for replay
+REVIEW|7fd8dc0b|fix: preserve prompt_toolkit editor picker and mirror it in TUI
+REVIEW|d056b610|fix: avoid prompt_toolkit complex tempfile bug and prefer nvim first
+REVIEW|2536a36f|fix(tui): route /save through session.save JSON-RPC
+REVIEW|1b8ca925|fix(tui): save live transcript from slash command
+REVIEW|db7c5735|fix: prefer vim over nano for $EDITOR fallback (CLI + TUI)
+REVIEW|8bbeaea6|fix(config): broaden api-key ref lookup to templated base_url
+REVIEW|1fdc31b2|fix(config): preserve custom provider api key refs
+REVIEW|5fac6c34|fix(cli): write editor draft to prompt.md so syntax highlighting works
+REVIEW|2c56dce0|fix(model): preserve custom endpoint credentials and accept cloud models not in /v1/models
+REVIEW|01cf2c65|chore(release): map iris@growthpillars.co to irispillars (#15825)
+REVIEW|b2d3308f|fix(doctor): accept bare custom provider
+SKIP|25ba6a4a|fix(gateway): make reasoning session-scoped by default
+REVIEW|4c797bfa|fix(cli): accept Alt+G as Ctrl+G fallback in VSCode/Cursor terminals
+REVIEW|c58956a9|fix(tui): accept Alt+G as Ctrl+G fallback in VSCode/Cursor terminals
+REVIEW|3944b225|fix(tui): suspend Ink properly when opening $EDITOR via Ctrl+G
+OTHER|489bed6f|Merge pull request #15478 from yes999zc/fix-deepseek-reasoning-all-assistant-messages
+SKIP|ad0ac894|fix: DeepSeek/Kimi thinking mode requires reasoning_content on ALL assistant messages
+REVIEW|dc4d92f1|docs: embed tutorial videos on webhooks + auxiliary models pages (#15809)
+REVIEW|47420a84|docs(obliteratus): link YouTube video guide in SKILL.md (#15808)
+OTHER|f93d4624|Merge pull request #15749 from Zjianru/fix/copy-reasoning-content-ordering-and-cross-provider-isolation
+SKIP|5ae60815|fix: remove has_reasoning guard — inject empty reasoning_content for DeepSeek/Kimi tool_calls unconditionally
+SKIP|88b65cc8|Update run_agent.py
+OTHER|edc78e25|Merge pull request #15766 from NousResearch/bb/tui-ssh-copy
+REVIEW|31d7f195|fix(tui): clamp copied selection bounds
+OTHER|b1c18e5a|refactor(tui): format screen imports
+REVIEW|bd66e55a|fix(tui): track rendered spaces for selection copy
+REVIEW|1735ced9|fix(tui): preserve code block indentation in selection
+REVIEW|bba16943|fix(tui): preserve rendered indentation in selections
+OTHER|132620ba|refactor(tui): simplify remote copy hotkey hints
+REVIEW|876bb600|fix(tui): trim whitespace-only selection chrome
+OTHER|a68793b6|refactor(tui): share remote shell detection
+REVIEW|bcc53624|fix(tui): honor client copy shortcut over ssh
+OTHER|283c8fd6|Merge pull request #15755 from NousResearch/bb/tui-model-flag
+REVIEW|919274b6|fix(tui): align overlay q shortcut casing
+OTHER|6e83d90e|refactor(tui): tighten overlay helpers
+REVIEW|c6fdf48b|fix(tui): sync inference model after switches
+REVIEW|a046483e|fix(tui): share overlay close controls
+REVIEW|fdcbd225|fix(tui): resolve startup model aliases statically
+REVIEW|48bdd244|fix(tui): apply ui-tui fix pass and restore type-check
+REVIEW|5e52011d|fix(tui): bind provider as model alias
+REVIEW|e48a497d|fix(tui): share static model detection
+REVIEW|2dfcc808|fix(tui): avoid network lookup during startup
+REVIEW|4db58d45|fix(tui): address startup provider review
+REVIEW|57b43fdd|fix(tui): preserve provider precedence on startup
+REVIEW|e9c47c70|fix(tui): honor launch model overrides
+OTHER|ee0728c6|Merge pull request #15351 from helix4u/fix/tui-rebuild-missing-ink-bundle
+SKIP|9daa0620|fix(agent): ordering fix in _copy_reasoning_content_for_api — cross-provider reasoning isolation
+REVIEW|648b8991|fix: use output_text for assistant message content in Codex Responses API (#15690)
+SKIP|7c17accb|fix: /stop now immediately aborts streaming retry loop
+REVIEW|5006b220|fix(update): honor RestartSec when polling for gateway respawn (#15707)
+OTHER|a9fa73a6|feat(oneshot): add --model / --provider / HERMES_INFERENCE_MODEL (#15704)
+OTHER|7c8c031f|feat: add `hermes -z <prompt>` one-shot mode (#15702)
+SKIP|ea01bdce|refactor(memory): remove flush_memories entirely (#15696)
+SKIP|d635e2df|fix(compression): pass provider to context length resolver in feasibility check
+REVIEW|cf2fabc4|docs(dashboard): document page-scoped plugin slots (#15662)
+OTHER|af22421e|feat(dashboard): page-scoped plugin slots for built-in pages (#15658)
+REVIEW|97d54f0e|fix(terminal): three-layer defense against watch_patterns notification spam (#15642)
+REVIEW|6e561ffa|fix(update): poll is-active instead of one-shot sleep(3) after gateway restart (#15639)
+REVIEW|ac05daa1|fix(tools): dedupe bundled plugin toolsets with built-in entries (#15634)
+REVIEW|3c1c65e7|fix(auxiliary): generalize unsupported-parameter detector and harden max_tokens retry (#15633)
+SKIP|f92006ce|fix(compression): reserve system+tools headroom when aux binds threshold (#15631)
+REVIEW|b35d692f|chore(release): map ash@users.noreply.github.com to ash
+REVIEW|facea845|fix(auxiliary): retry without temperature when any provider rejects it
+SKIP|f67a61dc|fix(flush_memories): strip temperature from codex_responses fallback (#15620)
+OTHER|6ed37e0f|feat(tools): make discord/discord_admin opt-in, Discord-only
+OTHER|591deeb9|feat(session): inject Discord IDs block when discord tool is loaded
+REVIEW|5ae07e7b|fix(session): gate stale "no Discord APIs" note on DISCORD_BOT_TOKEN
+OTHER|47b02e96|feat(discord): populate guild_id, parent_chat_id, message_id on SessionSource
+OTHER|0702231d|feat(session): add guild_id/parent_chat_id/message_id to SessionSource
+SKIP|db09477b|feat(feishu): wire feishu doc/drive tools into hermes-feishu composite
+SKIP|81987f03|feat(discord): split discord_server into discord + discord_admin tools
+REVIEW|9830905d|fix(tools): recover non-configurable toolsets from composite resolution
