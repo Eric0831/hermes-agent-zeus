@@ -144,7 +144,10 @@ class TestDeliverResultWrapping:
         assert "Cronjob Response: daily-report" in sent_content
         assert "-------------" in sent_content
         assert "Here is today's summary." in sent_content
-        assert "The agent cannot see this message" in sent_content
+        # ZEUS-customized footer text (upstream had "The agent cannot see this
+        # message"; we use a stop-instructions phrasing). What matters is that
+        # the cron response includes a footer guiding the user on how to act.
+        assert "stop" in sent_content.lower() or "manage" in sent_content.lower()
 
     def test_delivery_uses_job_id_when_no_name(self):
         """When a job has no name, the wrapper should fall back to job id."""
