@@ -205,6 +205,47 @@ def _normalize_tavily_search_results(response: dict) -> dict:
     return {"success": True, "data": {"web": web_results}}
 
 
+def _ddg_fallback_search(query: str, limit: int) -> dict:
+    """Run a DuckDuckGo text search and return results in the standard
+    web_search payload shape so callers can't tell it wasn't Tavily.
+
+    Used when Tavily returns 432 (plan quota exhausted) — keeps web_search
+    transparently usable until the user upgrades / quota resets. Adds a
+    `meta.backend = "ddg_fallback"` field so consumers who care can detect
+    the source, while the primary `data.web` list keeps the same shape.
+    """
+    try:
+        try:
+            from ddgs import DDGS  # newer package name
+        except ImportError:
+            from duckduckgo_search import DDGS  # legacy
+
+        web_results: List[Dict[str, Any]] = []
+        with DDGS() as ddgs:
+            for i, r in enumerate(ddgs.text(query, max_results=max(1, min(limit, 20)))):
+                web_results.append({
+                    "title": r.get("title", ""),
+                    "url": r.get("href") or r.get("url", ""),
+                    "description": r.get("body") or r.get("description", ""),
+                    "position": i + 1,
+                })
+        return {
+            "success": True,
+            "data": {"web": web_results},
+            "meta": {"backend": "ddg_fallback", "reason": "tavily_quota_exhausted"},
+        }
+    except Exception as ddg_err:
+        # Both backends down — surface clearly so the agent doesn't loop.
+        return {
+            "success": False,
+            "error": "both_backends_unavailable",
+            "details": (
+                f"Tavily quota exhausted; DDG fallback also failed: "
+                f"{type(ddg_err).__name__}: {str(ddg_err)[:200]}"
+            ),
+        }
+
+
 def _normalize_tavily_documents(response: dict, fallback_url: str = "") -> List[Dict[str, Any]]:
     """Normalize Tavily /extract or /crawl response to the standard document format.
 
@@ -848,24 +889,26 @@ def web_search_tool(query: str, limit: int = 5) -> str:
                     "include_images": False,
                 })
             except Exception as tavily_err:
-                # Surface plan-quota / auth errors as actionable guidance so
-                # the agent can pivot to the DDG MCP tool instead of looping.
                 msg = str(tavily_err)
                 if "432" in msg or "usage limit" in msg.lower() or "quota" in msg.lower():
-                    fallback_payload = {
-                        "success": False,
-                        "error": "tavily_quota_exhausted",
-                        "details": msg[:300],
-                        "fallback_hint": (
-                            "Tavily plan quota is exhausted for this billing cycle. "
-                            "Use the alternative tool `mcp_ddg_search_duckduckgo_web_search` "
-                            "for the same query — it's already enabled in this agent's toolset."
-                        ),
-                    }
-                    debug_call_data["error"] = "tavily_quota_exhausted"
+                    # Transparent fallback to DDG so the agent never sees
+                    # the upstream quota outage. Returns the SAME schema
+                    # web_search would produce so callers / followups
+                    # (web_extract, summarize) work unchanged.
+                    logger.warning(
+                        "Tavily quota exhausted — transparent fallback to DDG for query=%r",
+                        query,
+                    )
+                    ddg_payload = _ddg_fallback_search(query, limit)
+                    debug_call_data["results_count"] = len(
+                        ddg_payload.get("data", {}).get("web", [])
+                    )
+                    debug_call_data["error"] = "tavily_quota_exhausted_fell_back_to_ddg"
+                    out_json = json.dumps(ddg_payload, indent=2, ensure_ascii=False)
+                    debug_call_data["final_response_size"] = len(out_json)
                     _debug.log_call("web_search_tool", debug_call_data)
                     _debug.save()
-                    return json.dumps(fallback_payload, ensure_ascii=False)
+                    return out_json
                 raise  # re-raise non-quota errors for normal handling
             response_data = _normalize_tavily_search_results(raw)
             debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
