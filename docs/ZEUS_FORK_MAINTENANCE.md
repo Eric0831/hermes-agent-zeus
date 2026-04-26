@@ -103,7 +103,7 @@ source venv/bin/activate
 python -m pytest tests/ -q
 
 # 推送最新狀態到 fork
-git push zeus zeus-fork-v39
+git push origin main
 ```
 
 ### 重大版本
@@ -127,7 +127,7 @@ git remote -v
 git fetch upstream
 
 # 推送到自己的 fork
-git push zeus zeus-fork-v39
+git push origin main
 ```
 
 ---
