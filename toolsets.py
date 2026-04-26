@@ -170,7 +170,11 @@ TOOLSETS = {
     
     "memory": {
         "description": "Persistent memory across sessions (personal notes + user profile)",
-        "tools": ["memory"],
+        # `read_agent_memory` and `agent_admin` were registered in
+        # tools/memory_tool.py but never added to any toolset, so they were
+        # invisible to every agent. Wired into the memory toolset so they
+        # ship with any agent that already has memory access.
+        "tools": ["memory", "read_agent_memory", "agent_admin"],
         "includes": []
     },
     
