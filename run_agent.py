@@ -5453,6 +5453,11 @@ class AIAgent:
         """
         tool_calls = assistant_message.tool_calls
 
+        # Fresh per-turn cache for _invoke_tool's dedup of idempotent reads.
+        # Saves redundant calls when the LLM emits duplicate tool_calls in the
+        # same turn (e.g. read_file × 2 same path).
+        self._turn_tool_cache = {}
+
         # Allow _vprint during tool execution even with stream consumers
         self._executing_tools = True
         try:
@@ -5467,13 +5472,68 @@ class AIAgent:
         finally:
             self._executing_tools = False
 
+    # Tools whose results are cacheable for the duration of one assistant turn.
+    # Idempotent reads where calling twice in the same turn is wasteful.
+    _IDEMPOTENT_TOOLS_FOR_TURN_CACHE = {
+        "read_file", "read_agent_memory", "search_files", "skill_view",
+        "skills_list", "session_search", "web_search", "web_extract",
+        "mcp_filesystem_read_file", "mcp_filesystem_list_directory",
+        "mcp_filesystem_read_text_file", "mcp_filesystem_get_file_info",
+        "mcp_git_git_log", "mcp_git_git_status", "mcp_git_git_diff",
+    }
+
+    # Cap individual tool result size to prevent context blowup.
+    _TOOL_RESULT_MAX_CHARS = 50000
+
     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str) -> str:
         """Invoke a single tool and return the result string. No display logic.
 
         Handles both agent-level tools (todo, memory, etc.) and registry-dispatched
         tools. Used by the concurrent execution path; the sequential path retains
         its own inline invocation for backward-compatible display handling.
+
+        Optimizations (2026-04-26):
+        - Within-turn dedup cache for idempotent reads (saves redundant calls
+          when the LLM hallucinates calling the same tool twice).
+        - Auto-truncate results > 50KB with marker, preventing context blowup
+          from large file reads / web extracts.
         """
+        # Within-turn cache (cleared at start of each agent turn)
+        if function_name in self._IDEMPOTENT_TOOLS_FOR_TURN_CACHE:
+            cache_key = (function_name, json.dumps(function_args, sort_keys=True, default=str))
+            if not hasattr(self, "_turn_tool_cache"):
+                self._turn_tool_cache: dict = {}
+            cached = self._turn_tool_cache.get(cache_key)
+            if cached is not None:
+                logger.debug("Tool cache hit: %s args=%s", function_name, str(function_args)[:80])
+                return cached
+        else:
+            cache_key = None
+
+        result = self._invoke_tool_uncached(function_name, function_args, effective_task_id)
+
+        # Auto-truncate oversized results
+        if isinstance(result, str) and len(result) > self._TOOL_RESULT_MAX_CHARS:
+            head_len = int(self._TOOL_RESULT_MAX_CHARS * 0.7)
+            tail_len = self._TOOL_RESULT_MAX_CHARS - head_len - 200
+            truncated_marker = (
+                f"\n\n...[truncated: {function_name} result was {len(result)} chars, "
+                f"capped at {self._TOOL_RESULT_MAX_CHARS}; first {head_len} + last {tail_len} kept]...\n\n"
+            )
+            result = result[:head_len] + truncated_marker + result[-tail_len:]
+            logger.info(
+                "Tool %s result truncated: %d → %d chars",
+                function_name, len(result) + (head_len + tail_len + 200) - self._TOOL_RESULT_MAX_CHARS, len(result),
+            )
+
+        # Cache idempotent reads
+        if cache_key is not None and isinstance(result, str):
+            self._turn_tool_cache[cache_key] = result
+
+        return result
+
+    def _invoke_tool_uncached(self, function_name: str, function_args: dict, effective_task_id: str) -> str:
+        """Original tool dispatch logic — wrapped by _invoke_tool for caching."""
         if function_name == "todo":
             self._audit_agent_loop_tool_policy(function_name, function_args, effective_task_id)
             from tools.todo_tool import todo_tool as _todo_tool

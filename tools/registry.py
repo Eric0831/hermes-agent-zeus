@@ -224,7 +224,17 @@ class ToolRegistry:
         """
         entry = self._tools.get(name)
         if not entry:
-            return json.dumps({"error": f"Unknown tool: {name}"})
+            # Suggest similar tool names so the LLM can self-correct.
+            from difflib import get_close_matches
+            suggestions = get_close_matches(name, list(self._tools.keys()), n=3, cutoff=0.6)
+            payload: dict = {"error": "unknown_tool", "tool": name}
+            if suggestions:
+                payload["did_you_mean"] = suggestions
+                payload["hint"] = (
+                    f"Tool '{name}' is not registered. Did you mean: "
+                    f"{', '.join(suggestions)}?"
+                )
+            return json.dumps(payload, ensure_ascii=False)
         try:
             parameters_schema = (entry.schema or {}).get("parameters") or {}
             errors = _validate_schema(args, parameters_schema)
@@ -259,14 +269,21 @@ class ToolRegistry:
                 )
             return json.dumps(parsed, ensure_ascii=False)
         except ToolSchemaValidationError as exc:
-            return json.dumps(
-                {
-                    "error": "schema_validation_failed",
-                    "tool": name,
-                    "details": exc.details,
-                },
-                ensure_ascii=False,
-            )
+            # Surface a concrete example so the LLM can self-correct on next
+            # call instead of looping with the same wrong arg shape.
+            example = self._build_args_example(entry.schema or {})
+            payload: dict = {
+                "error": "schema_validation_failed",
+                "tool": name,
+                "details": exc.details,
+            }
+            if example:
+                payload["expected_args_example"] = example
+                payload["hint"] = (
+                    f"Required args for {name}: see expected_args_example. "
+                    f"Common cause: missing required field or wrong type."
+                )
+            return json.dumps(payload, ensure_ascii=False)
         except Exception as e:
             logger.exception("Tool %s dispatch error: %s", name, e)
             return json.dumps({"error": f"Tool execution failed: {type(e).__name__}: {e}"})
@@ -274,6 +291,40 @@ class ToolRegistry:
     # ------------------------------------------------------------------
     # Query helpers  (replace redundant dicts in model_tools.py)
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_args_example(tool_schema: dict) -> dict:
+        """Generate a minimal valid-args example from a tool's JSON-schema.
+
+        Used by dispatch() to give LLMs a concrete shape to imitate when
+        they pass wrong args. Only handles common cases (string, integer,
+        boolean, array, object) — exotic schemas just return {}.
+        """
+        params = (tool_schema or {}).get("parameters") or {}
+        if params.get("type") != "object":
+            return {}
+        props = params.get("properties") or {}
+        required = set(params.get("required") or [])
+        example: dict = {}
+        for key, spec in props.items():
+            if key not in required and len(example) >= 3:
+                continue  # cap at 3 fields for brevity unless required
+            t = spec.get("type")
+            if "enum" in spec and spec["enum"]:
+                example[key] = spec["enum"][0]
+            elif t == "string":
+                example[key] = spec.get("example") or f"<{key}>"
+            elif t == "integer":
+                example[key] = spec.get("example") or 1
+            elif t == "number":
+                example[key] = spec.get("example") or 1.0
+            elif t == "boolean":
+                example[key] = False
+            elif t == "array":
+                example[key] = []
+            elif t == "object":
+                example[key] = {}
+        return example
 
     def get_all_tool_names(self) -> List[str]:
         """Return sorted list of all registered tool names."""
