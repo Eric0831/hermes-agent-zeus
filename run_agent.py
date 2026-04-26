@@ -5676,6 +5676,31 @@ class AIAgent:
             except Exception as tool_error:
                 result = f"Error executing tool '{function_name}': {tool_error}"
                 logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
+                # Circuit breaker: track repeated identical-cause failures so
+                # a session doesn't accumulate hours of poisoning before any
+                # human notices. Pattern from 2026-04-26 production: caller
+                # /callee signature drift caused every tool call to TypeError;
+                # the agent kept logging errors into context until the LLM
+                # learned "tools don't work" and stopped calling them entirely.
+                err_signature = type(tool_error).__name__ + ":" + str(tool_error)[:80]
+                self._tool_failure_window = getattr(self, "_tool_failure_window", [])
+                self._tool_failure_window.append(err_signature)
+                self._tool_failure_window = self._tool_failure_window[-10:]
+                if len(self._tool_failure_window) >= 5 and \
+                        len(set(self._tool_failure_window[-5:])) == 1:
+                    # 5 consecutive identical-cause failures — likely systemic
+                    breaker_msg = (
+                        f"⚠️ Tool dispatch circuit breaker triggered: 5 "
+                        f"consecutive failures with the same error "
+                        f"({err_signature[:60]}). This usually means caller/"
+                        f"callee signature drift, schema validation issue, or "
+                        f"a misconfigured backend. Stopping further tool calls "
+                        f"in this turn — the session needs investigation by a "
+                        f"human (consider /reset to start a clean session)."
+                    )
+                    logger.critical(breaker_msg)
+                    self._tool_circuit_broken = True
+                    result = breaker_msg
             duration = time.time() - start
             is_error, _ = _detect_tool_failure(function_name, result)
             results[index] = (function_name, function_args, result, duration, is_error)

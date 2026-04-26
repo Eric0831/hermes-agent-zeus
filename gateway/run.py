@@ -1306,6 +1306,41 @@ class GatewayRunner:
         except Exception:
             pass
         
+        # Pre-flight smoke test: dispatch signature compatibility.
+        # Production crash 2026-04-26 was caller (run_agent._invoke_tool)
+        # passing kwargs the callee (model_tools.handle_function_call) didn't
+        # accept — TypeError on every tool call. Catch it at startup so the
+        # service surfaces the drift immediately instead of poisoning every
+        # active session's context with hours of failures.
+        try:
+            from model_tools import handle_function_call as _hfc_smoke
+            import inspect as _inspect_smoke
+            _smoke_sig = _inspect_smoke.signature(_hfc_smoke)
+            _smoke_params = set(_smoke_sig.parameters.keys())
+            _required_smoke = {
+                "function_name", "function_args", "task_id",
+                "enabled_tools", "honcho_manager", "honcho_session_key",
+                "session_db",
+            }
+            _missing_smoke = _required_smoke - _smoke_params
+            if _missing_smoke:
+                logger.critical(
+                    "GATEWAY STARTUP SMOKE TEST FAILED: handle_function_call "
+                    "is missing required kwargs that run_agent._invoke_tool "
+                    "passes: %s. Tool dispatch will TypeError on every call. "
+                    "Refusing to accept traffic. Fix model_tools.py + restart.",
+                    _missing_smoke,
+                )
+                # Don't sys.exit — let systemd see the critical log + keep
+                # process alive so operator can inspect; but mark as degraded.
+                self._dispatch_smoke_failed = True
+            else:
+                self._dispatch_smoke_failed = False
+                logger.info("Pre-flight: dispatch signature OK (%d params)", len(_smoke_params))
+        except Exception as _smoke_err:
+            logger.warning("Pre-flight smoke test could not run: %s", _smoke_err)
+            self._dispatch_smoke_failed = False  # don't block on instrumentation issues
+
         # Emit gateway:startup hook
         hook_count = len(self.hooks.loaded_hooks)
         if hook_count:
