@@ -567,7 +567,12 @@ def remove_job(job_id: str) -> bool:
     return False
 
 
-def mark_job_run(job_id: str, success: bool, error: Optional[str] = None):
+def mark_job_run(
+    job_id: str,
+    success: bool,
+    error: Optional[str] = None,
+    delivery_error: Optional[str] = None,
+):
     """
     Mark a job as having been run.
     
@@ -581,6 +586,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None):
             job["last_run_at"] = now
             job["last_status"] = "ok" if success else "error"
             job["last_error"] = error if not success else None
+            job["last_delivery_error"] = delivery_error
             
             # Increment completed count
             if job.get("repeat"):

@@ -8,6 +8,7 @@ Uses a file-based lock (~/.hermes/cron/.tick.lock) so only one tick
 runs at a time if multiple processes overlap.
 """
 
+import argparse
 import asyncio
 import concurrent.futures
 import contextvars
@@ -16,6 +17,7 @@ import logging
 import os
 import subprocess
 import sys
+import time
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -89,6 +91,32 @@ _hermes_home = get_hermes_home()
 # File-based lock prevents concurrent ticks from gateway + daemon + systemd timer
 _LOCK_DIR = _hermes_home / "cron"
 _LOCK_FILE = _LOCK_DIR / ".tick.lock"
+
+
+def _configure_runtime_environment() -> None:
+    """Ensure scheduler child tools can resolve local CLIs and writable caches."""
+    extra_bins = [
+        str(Path.home() / ".local" / "bin"),
+        str(Path.home() / ".cargo" / "bin"),
+        str(Path.home() / "go" / "bin"),
+    ]
+    current_path = os.environ.get("PATH", "")
+    path_entries = current_path.split(os.pathsep) if current_path else []
+    for candidate in reversed(extra_bins):
+        if Path(candidate).exists() and candidate not in path_entries:
+            path_entries.insert(0, candidate)
+    os.environ["PATH"] = os.pathsep.join(path_entries)
+
+    npm_cache = _hermes_home / ".npm"
+    npm_tmp = _hermes_home / ".npm-tmp"
+    npm_cache.mkdir(parents=True, exist_ok=True)
+    npm_tmp.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("NPM_CONFIG_CACHE", str(npm_cache))
+    os.environ.setdefault("npm_config_cache", str(npm_cache))
+    os.environ.setdefault("TMPDIR", str(npm_tmp))
+
+
+_configure_runtime_environment()
 
 
 def _resolve_origin(job: dict) -> Optional[dict]:
@@ -1148,5 +1176,30 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
         lock_fd.close()
 
 
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Hermes cron scheduler")
+    parser.add_argument("--loop", action="store_true", help="Run tick() continuously")
+    parser.add_argument(
+        "--interval",
+        type=float,
+        default=float(os.getenv("HERMES_CRON_POLL_SECONDS", "10")),
+        help="Loop poll interval in seconds when --loop is set",
+    )
+    args = parser.parse_args(argv)
+
+    if not args.loop:
+        tick(verbose=True)
+        return 0
+
+    interval = max(1.0, float(args.interval))
+    logger.info("cron.scheduler loop started (interval=%ss)", interval)
+    while True:
+        try:
+            tick(verbose=True)
+        except Exception:
+            logger.exception("cron.scheduler loop tick failed")
+        time.sleep(interval)
+
+
 if __name__ == "__main__":
-    tick(verbose=True)
+    raise SystemExit(main())

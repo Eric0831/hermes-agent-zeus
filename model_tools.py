@@ -375,6 +375,7 @@ def handle_function_call(
     enabled_tools: Optional[List[str]] = None,
     honcho_manager: Optional[Any] = None,
     honcho_session_key: Optional[str] = None,
+    session_db: Optional[Any] = None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -419,7 +420,7 @@ def handle_function_call(
         try:
             from brain.policy import evaluate as _policy_evaluate
             from hermes_state import SessionDB as _SessionDB
-            _policy_db = _SessionDB()
+            _policy_db = session_db or _SessionDB()
             _task_risk = "low"
             if task_id:
                 try:
