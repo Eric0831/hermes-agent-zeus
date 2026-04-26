@@ -365,7 +365,12 @@ Write only the summary body. Do not include any preamble or prefix."""
 
         # Size output budget so prompt + output fits the summarizer's context.
         # Reserve a small safety margin for chat-template + role tokens.
-        _SAFETY = 256
+        # Reserve enough headroom for chat-template tokens + tokenizer
+        # variance. Was 256 — repeatedly tripped 1-token overflow on the
+        # 9B summarizer (16384 ctx) when prompt+output computed to exactly
+        # 16385. 1024 absorbs the variance with negligible loss of useful
+        # output budget.
+        _SAFETY = 1024
         prompt_tokens_est = estimate_messages_tokens_rough(
             [{"role": "user", "content": prompt}]
         )
