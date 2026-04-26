@@ -5485,6 +5485,52 @@ class AIAgent:
     # Cap individual tool result size to prevent context blowup.
     _TOOL_RESULT_MAX_CHARS = 50000
 
+    # Per-tool timeout (seconds). Tools not listed default to _DEFAULT_TOOL_TIMEOUT.
+    # Slow tools that genuinely need more time (delegate_task spawns a subagent
+    # which may run for minutes) get longer budgets; fast tools get tight ones
+    # so a hung MCP server doesn't block the whole batch.
+    _DEFAULT_TOOL_TIMEOUT = 60.0
+    _PER_TOOL_TIMEOUT: dict = {
+        "delegate_task": 600.0,
+        "execute_code": 120.0,
+        "terminal": 90.0,
+        "process": 60.0,
+        "web_search": 45.0,
+        "web_extract": 60.0,
+        "vision_analyze": 60.0,
+        "session_search": 45.0,
+        "image_generate": 90.0,
+        "local_image_generate": 120.0,
+        "mixture_of_agents": 300.0,
+        "browser_navigate": 45.0,
+        "browser_snapshot": 30.0,
+        "memory": 15.0,
+        "todo": 5.0,
+        "skills_list": 10.0,
+        "skill_view": 10.0,
+        "read_file": 15.0,
+        "write_file": 30.0,
+    }
+
+    # Transient-error patterns: a tool failure matching these is retried once
+    # with backoff. Non-transient errors (TypeError, ValueError, programming
+    # bugs) are NOT retried — they'd just fail again and waste latency.
+    _TRANSIENT_ERROR_RE = __import__("re").compile(
+        r"timeout|connection\s*reset|broken\s*pipe|read\s*timed\s*out|"
+        r"\b(503|502|504|429)\b|rate.?limit|temporary\s*failure|"
+        r"service\s*unavailable|connection\s*refused|temporarily\s*unavailable",
+        __import__("re").IGNORECASE,
+    )
+
+    @classmethod
+    def _is_transient_tool_error(cls, err: BaseException) -> bool:
+        if isinstance(err, (TimeoutError, ConnectionError, BrokenPipeError)):
+            return True
+        # Don't retry programming/contract errors
+        if isinstance(err, (TypeError, KeyError, AttributeError, NameError)):
+            return False
+        return bool(cls._TRANSIENT_ERROR_RE.search(str(err)))
+
     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str) -> str:
         """Invoke a single tool and return the result string. No display logic.
 
@@ -5731,11 +5777,49 @@ class AIAgent:
         def _run_tool(index, tool_call, function_name, function_args):
             """Worker function executed in a thread."""
             start = time.time()
-            try:
-                result = self._invoke_tool(function_name, function_args, effective_task_id)
-            except Exception as tool_error:
-                result = f"Error executing tool '{function_name}': {tool_error}"
-                logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
+            timeout_s = self._PER_TOOL_TIMEOUT.get(function_name, self._DEFAULT_TOOL_TIMEOUT)
+            inner_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            attempts = 0
+            tool_error = None
+            result = None
+            while attempts < 2:  # max 1 retry on transient errors
+                attempts += 1
+                try:
+                    fut = inner_executor.submit(
+                        self._invoke_tool, function_name, function_args, effective_task_id
+                    )
+                    result = fut.result(timeout=timeout_s)
+                    break  # success
+                except concurrent.futures.TimeoutError:
+                    fut.cancel()
+                    result = json.dumps({
+                        "success": False,
+                        "error": "tool_timeout",
+                        "tool": function_name,
+                        "timeout_seconds": timeout_s,
+                        "hint": (
+                            f"Tool '{function_name}' did not return within {timeout_s}s. "
+                            f"Consider narrowing the request (smaller file, fewer items) "
+                            f"or use an alternative tool."
+                        ),
+                    }, ensure_ascii=False)
+                    logger.warning("Tool %s timed out after %.1fs", function_name, timeout_s)
+                    break  # don't retry timeout (likely repeats)
+                except Exception as e:
+                    tool_error = e
+                    if attempts == 1 and self._is_transient_tool_error(e):
+                        logger.info(
+                            "Tool %s transient error: %s — retrying once after 1s",
+                            function_name, type(e).__name__,
+                        )
+                        time.sleep(1.0)
+                        continue
+                    # Non-transient or out of retries
+                    result = f"Error executing tool '{function_name}': {e}"
+                    logger.error("_invoke_tool raised for %s: %s", function_name, e, exc_info=True)
+                    break
+            inner_executor.shutdown(wait=False)
+            if tool_error and result and result.startswith("Error executing tool"):
                 # Circuit breaker: track repeated identical-cause failures so
                 # a session doesn't accumulate hours of poisoning before any
                 # human notices. Pattern from 2026-04-26 production: caller
