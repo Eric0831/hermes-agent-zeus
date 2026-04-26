@@ -55,6 +55,13 @@ class Platform(Enum):
     EMAIL = "email"
     SMS = "sms"
     DINGTALK = "dingtalk"
+    FEISHU = "feishu"            # Lark / Feishu
+    WECOM = "wecom"              # WeCom (企業微信) outbound
+    WECOM_CALLBACK = "wecom_callback"  # WeCom inbound callback
+    WEIXIN = "weixin"            # personal WeChat
+    BLUEBUBBLES = "bluebubbles"  # iMessage via BlueBubbles bridge
+    QQBOT = "qqbot"              # QQ bot
+    # All above referenced by cron/scheduler.py:_deliver_result platform map.
     API_SERVER = "api_server"
     WEBHOOK = "webhook"
 

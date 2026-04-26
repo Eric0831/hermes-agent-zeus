@@ -738,7 +738,7 @@ class ShellFileOperations(FileOperations):
         # Import and use fuzzy matching
         from tools.fuzzy_match import fuzzy_find_and_replace
         
-        new_content, match_count, error = fuzzy_find_and_replace(
+        new_content, match_count, _strategy, error = fuzzy_find_and_replace(
             content, old_string, new_string, replace_all
         )
         

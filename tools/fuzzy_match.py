@@ -20,13 +20,17 @@ Multi-occurrence matching is handled via the replace_all flag.
 
 Usage:
     from tools.fuzzy_match import fuzzy_find_and_replace
-    
-    new_content, match_count, error = fuzzy_find_and_replace(
+
+    new_content, match_count, strategy, error = fuzzy_find_and_replace(
         content="def foo():\\n    pass",
         old_string="def foo():",
         new_string="def bar():",
         replace_all=False
     )
+
+`strategy` is the name of the strategy that matched (e.g. "exact",
+"line_trimmed"), or None on failure. Useful for debug / "did you mean"
+feedback (see commit dbf5c132).
 """
 
 import re
@@ -48,27 +52,32 @@ def _unicode_normalize(text: str) -> str:
 
 
 def fuzzy_find_and_replace(content: str, old_string: str, new_string: str,
-                            replace_all: bool = False) -> Tuple[str, int, Optional[str]]:
+                            replace_all: bool = False) -> Tuple[str, int, Optional[str], Optional[str]]:
     """
     Find and replace text using a chain of increasingly fuzzy matching strategies.
-    
+
     Args:
         content: The file content to search in
         old_string: The text to find
         new_string: The replacement text
         replace_all: If True, replace all occurrences; if False, require uniqueness
-    
+
     Returns:
-        Tuple of (new_content, match_count, error_message)
-        - If successful: (modified_content, number_of_replacements, None)
-        - If failed: (original_content, 0, error_description)
+        Tuple of (new_content, match_count, strategy_name, error_message)
+        - If successful: (modified_content, number_of_replacements, strategy_name, None)
+        - If failed:     (original_content, 0, None, error_description)
+        - On ambiguous match (multiple matches without replace_all):
+                         (original_content, 0, strategy_name, error_description)
+        `strategy_name` identifies which fuzzy strategy succeeded (or which one
+        first found ambiguous matches), enabling caller to surface
+        "did you mean ...?" hints (commit dbf5c132).
     """
     if not old_string:
-        return content, 0, "old_string cannot be empty"
-    
+        return content, 0, None, "old_string cannot be empty"
+
     if old_string == new_string:
-        return content, 0, "old_string and new_string are identical"
-    
+        return content, 0, None, "old_string and new_string are identical"
+
     # Try each matching strategy in order
     strategies: List[Tuple[str, Callable]] = [
         ("exact", _strategy_exact),
@@ -76,28 +85,29 @@ def fuzzy_find_and_replace(content: str, old_string: str, new_string: str,
         ("whitespace_normalized", _strategy_whitespace_normalized),
         ("indentation_flexible", _strategy_indentation_flexible),
         ("escape_normalized", _strategy_escape_normalized),
+        ("unicode_normalized", _strategy_unicode_normalized),
         ("trimmed_boundary", _strategy_trimmed_boundary),
         ("block_anchor", _strategy_block_anchor),
         ("context_aware", _strategy_context_aware),
     ]
-    
+
     for strategy_name, strategy_fn in strategies:
         matches = strategy_fn(content, old_string)
-        
+
         if matches:
             # Found matches with this strategy
             if len(matches) > 1 and not replace_all:
-                return content, 0, (
+                return content, 0, strategy_name, (
                     f"Found {len(matches)} matches for old_string. "
                     f"Provide more context to make it unique, or use replace_all=True."
                 )
-            
+
             # Perform replacement
             new_content = _apply_replacements(content, matches, new_string)
-            return new_content, len(matches), None
-    
+            return new_content, len(matches), strategy_name, None
+
     # No strategy found a match
-    return content, 0, "Could not find a match for old_string in the file"
+    return content, 0, None, "Could not find a match for old_string in the file"
 
 
 def _apply_replacements(content: str, matches: List[Tuple[int, int]], new_string: str) -> str:
@@ -197,6 +207,43 @@ def _strategy_indentation_flexible(content: str, pattern: str) -> List[Tuple[int
     )
 
 
+def _strategy_unicode_normalized(content: str, pattern: str) -> List[Tuple[int, int]]:
+    """
+    Strategy 5a: Normalize Unicode look-alikes (smart quotes, em/en dashes,
+    ellipsis, NBSP) in content to their ASCII equivalents and search for
+    pattern as-is. Fires when content contains Unicode chars that the
+    pattern wrote as ASCII (common for LLM-generated patches against
+    docs / strings copy-pasted from rich text).
+    """
+    norm_content = _unicode_normalize(content)
+    if norm_content == content:
+        # No unicode look-alikes to normalize → skip
+        return []
+    matches = _strategy_exact(norm_content, pattern)
+    if not matches:
+        return []
+    # Map normalized indices back to original-content indices.
+    # _unicode_normalize is char-substitution only (some replacements are
+    # multi-char like — → "--", so byte offsets diverge). Walk both
+    # strings in parallel to translate (start, end) ranges.
+    out: List[Tuple[int, int]] = []
+    for start, end in matches:
+        orig_start = _map_normalized_index(content, start)
+        orig_end = _map_normalized_index(content, end)
+        out.append((orig_start, orig_end))
+    return out
+
+
+def _map_normalized_index(original: str, norm_idx: int) -> int:
+    """Translate an index from the unicode-normalized string back to original."""
+    seen = 0
+    for i, ch in enumerate(original):
+        if seen >= norm_idx:
+            return i
+        seen += len(UNICODE_MAP.get(ch, ch))
+    return len(original)
+
+
 def _strategy_escape_normalized(content: str, pattern: str) -> List[Tuple[int, int]]:
     """
     Strategy 5: Convert escape sequences to actual characters.
@@ -290,8 +337,12 @@ def _strategy_block_anchor(content: str, pattern: str) -> List[Tuple[int, int]]:
     matches = []
     candidate_count = len(potential_matches)
     
-    # Thresholding logic: 0.10 for unique matches (max flexibility), 0.30 for multiple candidates
-    threshold = 0.10 if candidate_count == 1 else 0.30
+    # Thresholding logic — raised from 0.10/0.30 to 0.50 (Bug 4 fix). Lower
+    # thresholds matched blocks where the middle was completely unrelated,
+    # silently corrupting files. 0.50 = at least half of the middle text
+    # must overlap, balancing recall (real near-misses still match) and
+    # precision (unrelated middles rejected).
+    threshold = 0.50
 
     for i in potential_matches:
         if pattern_line_count <= 2:

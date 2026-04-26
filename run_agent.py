@@ -5046,10 +5046,17 @@ class AIAgent:
         # compression, title generation.
         if isinstance(_san_content, str) and _san_content:
             _san_content = self._strip_think_blocks(_san_content).strip()
+        # Also strip unterminated <think> openings (some providers like
+        # MiniMax / NIM drop the close tag mid-stream) — leaving them in
+        # would carry "thinking" forever into downstream context.
+        if isinstance(_san_content, str) and "<think>" in _san_content:
+            _san_content = re.sub(
+                r"<think>.*$", "", _san_content, flags=re.DOTALL
+            ).strip()
 
         msg = {
             "role": "assistant",
-            "content": assistant_message.content or "",
+            "content": _san_content,
             "reasoning": reasoning_text,
             "finish_reason": finish_reason,
         }
