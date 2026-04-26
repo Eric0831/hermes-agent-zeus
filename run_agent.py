@@ -5485,6 +5485,22 @@ class AIAgent:
     # Cap individual tool result size to prevent context blowup.
     _TOOL_RESULT_MAX_CHARS = 50000
 
+    # Above this threshold, instead of head/tail truncation we hand the result
+    # to the auxiliary summarizer (9B) so the LLM gets a compressed but
+    # information-preserving version. Only applies to tools where summarization
+    # is meaningful (text-heavy tools, not structured registries / status).
+    _TOOL_RESULT_SUMMARIZE_THRESHOLD = 100000  # 100KB
+    _TOOLS_FRIENDLY_TO_SUMMARIZATION = {
+        "web_extract", "read_file", "search_files", "web_search",
+        "session_search", "mcp_filesystem_read_file",
+        "mcp_filesystem_read_text_file", "mcp_filesystem_search_files",
+        "mcp_git_git_log", "mcp_git_git_diff", "mcp_git_git_diff_staged",
+        "mcp_git_git_diff_unstaged", "mcp_git_git_show", "vision_analyze",
+    }
+    # Cache content-hash → summary to avoid re-summarizing the same result.
+    _SUMMARIZE_CACHE: dict = {}
+    _SUMMARIZE_CACHE_MAX = 50
+
     # Per-tool timeout (seconds). Tools not listed default to _DEFAULT_TOOL_TIMEOUT.
     # Slow tools that genuinely need more time (delegate_task spawns a subagent
     # which may run for minutes) get longer budgets; fast tools get tight ones
@@ -5558,25 +5574,115 @@ class AIAgent:
 
         result = self._invoke_tool_uncached(function_name, function_args, effective_task_id)
 
-        # Auto-truncate oversized results
+        # Oversized-result handling: summarize via aux LLM when very large
+        # AND tool is summarization-friendly; otherwise head/tail truncate.
         if isinstance(result, str) and len(result) > self._TOOL_RESULT_MAX_CHARS:
-            head_len = int(self._TOOL_RESULT_MAX_CHARS * 0.7)
-            tail_len = self._TOOL_RESULT_MAX_CHARS - head_len - 200
-            truncated_marker = (
-                f"\n\n...[truncated: {function_name} result was {len(result)} chars, "
-                f"capped at {self._TOOL_RESULT_MAX_CHARS}; first {head_len} + last {tail_len} kept]...\n\n"
-            )
-            result = result[:head_len] + truncated_marker + result[-tail_len:]
-            logger.info(
-                "Tool %s result truncated: %d → %d chars",
-                function_name, len(result) + (head_len + tail_len + 200) - self._TOOL_RESULT_MAX_CHARS, len(result),
-            )
+            original_size = len(result)
+            if (original_size > self._TOOL_RESULT_SUMMARIZE_THRESHOLD
+                    and function_name in self._TOOLS_FRIENDLY_TO_SUMMARIZATION):
+                summarized = self._try_summarize_tool_result(function_name, result)
+                if summarized is not None:
+                    result = summarized
+                    logger.info(
+                        "Tool %s result LLM-summarized: %d → %d chars",
+                        function_name, original_size, len(result),
+                    )
+                else:
+                    # Summarizer unavailable / errored — fall back to truncate
+                    head_len = int(self._TOOL_RESULT_MAX_CHARS * 0.7)
+                    tail_len = self._TOOL_RESULT_MAX_CHARS - head_len - 200
+                    marker = (
+                        f"\n\n...[truncated: {function_name} result was "
+                        f"{original_size} chars; summarizer unavailable, "
+                        f"showing first {head_len} + last {tail_len} chars]...\n\n"
+                    )
+                    result = result[:head_len] + marker + result[-tail_len:]
+            else:
+                head_len = int(self._TOOL_RESULT_MAX_CHARS * 0.7)
+                tail_len = self._TOOL_RESULT_MAX_CHARS - head_len - 200
+                marker = (
+                    f"\n\n...[truncated: {function_name} result was "
+                    f"{original_size} chars, capped at "
+                    f"{self._TOOL_RESULT_MAX_CHARS}; first {head_len} + "
+                    f"last {tail_len} kept]...\n\n"
+                )
+                result = result[:head_len] + marker + result[-tail_len:]
+                logger.info(
+                    "Tool %s result truncated: %d → %d chars",
+                    function_name, original_size, len(result),
+                )
 
         # Cache idempotent reads
         if cache_key is not None and isinstance(result, str):
             self._turn_tool_cache[cache_key] = result
 
         return result
+
+    def _try_summarize_tool_result(self, function_name: str, raw: str) -> Optional[str]:
+        """LLM-compress a large tool result while preserving info.
+
+        Returns a summary payload (JSON string) on success, or None if the
+        summarizer is unavailable / errored — caller falls back to truncate.
+        """
+        # Content-hash cache to avoid re-summarizing identical results
+        # within the process lifetime (e.g. read_file × 2 same path → same
+        # bytes after our turn-cache misses across turns).
+        import hashlib
+        h = hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()[:16]
+        cache_key = (function_name, h)
+        cached = self._SUMMARIZE_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        try:
+            from agent.auxiliary_client import call_llm
+        except Exception as e:
+            logger.debug("Summarizer unavailable: %s", e)
+            return None
+
+        # Cap input we feed to summarizer at 80KB so we don't exceed 9B's
+        # 16K context. ~ 4 chars/token → 80KB ≈ 20K tokens of input;
+        # leaves headroom for prompt + 4K output.
+        input_text = raw[:80000]
+        prompt = (
+            f"Summarize this tool result from `{function_name}` in 600-1200 "
+            f"tokens. Preserve concrete details: file paths, commands, "
+            f"error messages, function/class names, URLs, version numbers, "
+            f"key data points. Drop boilerplate / repetition / ad copy. "
+            f"Use markdown bullet structure for scanability.\n\n"
+            f"TOOL RESULT TO SUMMARIZE:\n{input_text}"
+        )
+        try:
+            resp = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=2000,
+                timeout=30.0,
+            )
+            content = resp.choices[0].message.content if resp and resp.choices else ""
+            if not content or len(content.strip()) < 100:
+                return None
+            # Wrap in JSON envelope so downstream parsers see structured payload
+            payload = json.dumps({
+                "success": True,
+                "result_summary": content.strip(),
+                "original_size_chars": len(raw),
+                "summarized_via": "auxiliary_compression_9B",
+                "note": (
+                    "Original tool result was large; this is an LLM-generated "
+                    "summary preserving key info. Call the tool with narrower "
+                    "args if you need raw output."
+                ),
+            }, ensure_ascii=False)
+        except Exception as e:
+            logger.warning("Summarizer call failed for %s: %s", function_name, e)
+            return None
+
+        # Cache (with simple LRU eviction)
+        if len(self._SUMMARIZE_CACHE) >= self._SUMMARIZE_CACHE_MAX:
+            self._SUMMARIZE_CACHE.pop(next(iter(self._SUMMARIZE_CACHE)))
+        self._SUMMARIZE_CACHE[cache_key] = payload
+        return payload
 
     def _invoke_tool_uncached(self, function_name: str, function_args: dict, effective_task_id: str) -> str:
         """Original tool dispatch logic — wrapped by _invoke_tool for caching."""
