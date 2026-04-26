@@ -1,16 +1,22 @@
 # ZEUS Fork Maintenance Guide
 
+> **2026-04-26 update**: This doc reflects the OLD cherry-pick strategy and is
+> kept as historical reference. The current strategy is documented in
+> [FORK_STRATEGY.md](FORK_STRATEGY.md): treat the codebase as **independent**,
+> use upstream as read-only inspiration, write ZEUS-native equivalents instead
+> of cherry-picking.
+
 ## 架構說明
 
-本 repo 是 `NousResearch/hermes-agent` 的 ZEUS 自訂 fork。
-ZEUS 在 upstream 基礎上加入了大量自訂模組，因此**無法直接升級 upstream**。
+本 repo 起源於 `NousResearch/hermes-agent` 的 fork，但已演化為**獨立 codebase**
+（1410 個 upstream 檔案不存在於 ZEUS、498 個檔案已 modify、194 個 ZEUS-only 檔案）。
 
 - **本機 repo**: `https://github.com/Eric0831/hermes-agent-zeus`
-- **Upstream**: `https://github.com/NousResearch/hermes-agent`
-- **工作 branch**: `zeus-fork-v39`
+- **Upstream**: `https://github.com/NousResearch/hermes-agent`（**reference only**）
+- **主要 branch**: `main`（前身 `zeus-fork-v39`，已於 2026-04-26 重命名）
 - **主要 remote**:
-  - `origin` → Eric0831/hermes-agent-zeus（本機推送目標）
-  - `upstream` → NousResearch/hermes-agent（只讀，cherry-pick 來源）
+  - `origin` → Eric0831/hermes-agent-zeus（推送目標）
+  - `upstream` → NousResearch/hermes-agent（只讀，靈感來源，**不再 cherry-pick**）
 
 ---
 

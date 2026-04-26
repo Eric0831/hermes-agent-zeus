@@ -1,16 +1,23 @@
 #!/usr/bin/env bash
 # ============================================================
-# ZEUS Upstream Sync — cherry-pick 安全評估腳本
-# 用途：掃描 upstream (NousResearch/hermes-agent) 新增 commit，
-#       自動分類為 SAFE / REVIEW / SKIP
-# 執行：bash scripts/zeus_upstream_sync.sh
+# ⚠️  DEPRECATED 2026-04-26
+# ============================================================
+#
+# This script implements the old "cherry-pick from upstream" strategy.
+# Reality check on 2026-04-26 found the fork has diverged beyond
+# cherry-pick feasibility (5/5 candidates conflicted on protected files).
+#
+# NEW STRATEGY: see docs/FORK_STRATEGY.md
+# NEW TOOL:     scripts/zeus_upstream_watch.sh
+#
+# Kept for historical reference. Do NOT run; output is no longer actionable.
 # ============================================================
 
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 UPSTREAM_REMOTE="upstream"
-ZEUS_BRANCH="zeus-fork-v39"
+ZEUS_BRANCH="main"   # was "zeus-fork-v39", renamed 2026-04-26
 REPORT_FILE="$REPO_DIR/docs/zeus_upstream_sync_$(date +%Y%m%d).md"
 
 # 核心自訂檔案 — 這些永遠 SKIP

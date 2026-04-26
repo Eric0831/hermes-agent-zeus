@@ -46,9 +46,13 @@ ZEUS 自己的 fixes/features 直接在主線開發，commit message 用 convent
 ## Branch 結構（變更後）
 
 ```
-main                  ← canonical primary (從 zeus-fork-v39 重命名而來)
-archive/*             ← 凍結的歷史分支
-upstream/main         ← read-only reference，never merge
+main                                          ← canonical primary
+                                                (前身 zeus-fork-v39，2026-04-26 重命名)
+archive/main-pre-zeus-v39-2026-04-26          ← 凍結舊 main（落後 upstream 3117）
+archive/cherry-picks-attempt-20260420         ← 凍結 4/20 cherry-pick 實驗
+archive/origin-main-overwritten-2026-04-26    ← force push 前的 origin/main 備份
+wip-v40-brain-incomplete                      ← V40 brain WIP 暫存
+upstream/main                                 ← read-only reference，never merge
 ```
 
 ## PROTECTED_FILES 列表已過時
