@@ -840,12 +840,33 @@ def web_search_tool(query: str, limit: int = 5) -> str:
 
         if backend == "tavily":
             logger.info("Tavily search: '%s' (limit: %d)", query, limit)
-            raw = _tavily_request("search", {
-                "query": query,
-                "max_results": min(limit, 20),
-                "include_raw_content": False,
-                "include_images": False,
-            })
+            try:
+                raw = _tavily_request("search", {
+                    "query": query,
+                    "max_results": min(limit, 20),
+                    "include_raw_content": False,
+                    "include_images": False,
+                })
+            except Exception as tavily_err:
+                # Surface plan-quota / auth errors as actionable guidance so
+                # the agent can pivot to the DDG MCP tool instead of looping.
+                msg = str(tavily_err)
+                if "432" in msg or "usage limit" in msg.lower() or "quota" in msg.lower():
+                    fallback_payload = {
+                        "success": False,
+                        "error": "tavily_quota_exhausted",
+                        "details": msg[:300],
+                        "fallback_hint": (
+                            "Tavily plan quota is exhausted for this billing cycle. "
+                            "Use the alternative tool `mcp_ddg_search_duckduckgo_web_search` "
+                            "for the same query — it's already enabled in this agent's toolset."
+                        ),
+                    }
+                    debug_call_data["error"] = "tavily_quota_exhausted"
+                    _debug.log_call("web_search_tool", debug_call_data)
+                    _debug.save()
+                    return json.dumps(fallback_payload, ensure_ascii=False)
+                raise  # re-raise non-quota errors for normal handling
             response_data = _normalize_tavily_search_results(raw)
             debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
             result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
