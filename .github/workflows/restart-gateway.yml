@@ -1,0 +1,90 @@
+name: Restart Hermes Gateway
+
+# Manually-triggered restart of the Hermes gateway service on the
+# self-hosted runner host. Lighter than a full reboot (~10 seconds).
+#
+# Requires a self-hosted runner registered with the label `zeus-host`,
+# and the repo checked out on the host (default: $HOME/hermes-agent-zeus).
+# The runner's OS user needs to be able to run `python -m hermes_cli.main`
+# from the repo (the same way it's run interactively).
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo_path:
+        description: 'Repo checkout path on the host (~ expands to $HOME)'
+        required: false
+        default: '~/hermes-agent-zeus'
+        type: string
+      force:
+        description: 'Force: gateway-stop + gateway-up instead of restart'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: restart-gateway
+  cancel-in-progress: false
+
+jobs:
+  restart:
+    runs-on: [self-hosted, zeus-host]
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Resolve repo path
+        id: resolve
+        run: |
+          REPO_PATH="${{ inputs.repo_path }}"
+          REPO_PATH="${REPO_PATH/#\~/$HOME}"
+          if [ ! -d "$REPO_PATH" ]; then
+            echo "::error::Repo path not found: $REPO_PATH"
+            exit 1
+          fi
+          echo "path=$REPO_PATH" >>"$GITHUB_OUTPUT"
+          echo "Resolved repo path: $REPO_PATH"
+
+      - name: Log trigger metadata
+        run: |
+          echo "Triggered by: ${{ github.actor }}"
+          echo "Force mode:   ${{ inputs.force }}"
+          echo "Time (UTC):   $(date -u -Iseconds)"
+          echo "Host:         $(hostname)"
+
+      - name: Pre-restart status
+        continue-on-error: true
+        working-directory: ${{ steps.resolve.outputs.path }}
+        run: |
+          export PYTHONPATH="$PWD"
+          python3 -m hermes_cli.main gateway status || true
+
+      - name: Restart gateway
+        working-directory: ${{ steps.resolve.outputs.path }}
+        run: |
+          export PYTHONPATH="$PWD"
+          if [ "${{ inputs.force }}" = "true" ]; then
+            echo "Force mode: stopping then starting"
+            ./scripts/gateway-stop || true
+            ./scripts/gateway-up
+          else
+            python3 -m hermes_cli.main gateway restart
+          fi
+
+      - name: Post-restart status
+        working-directory: ${{ steps.resolve.outputs.path }}
+        run: |
+          export PYTHONPATH="$PWD"
+          # Give the gateway a moment to come up before probing.
+          sleep 3
+          python3 -m hermes_cli.main gateway status
+
+      - name: Healthcheck
+        continue-on-error: true
+        working-directory: ${{ steps.resolve.outputs.path }}
+        run: |
+          if [ -x ./scripts/gateway-healthcheck ]; then
+            ./scripts/gateway-healthcheck
+          else
+            echo "gateway-healthcheck not executable; skipping"
+          fi
