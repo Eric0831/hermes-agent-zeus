@@ -1,0 +1,60 @@
+name: Reboot Host
+
+# Manually-triggered reboot of the self-hosted runner machine.
+# Requires:
+#   1. A self-hosted runner registered with the label `zeus-host`.
+#   2. The runner's OS user can run `/sbin/shutdown` without a password.
+#      Add to /etc/sudoers.d/zeus-runner (replace USERNAME):
+#        USERNAME ALL=(root) NOPASSWD: /sbin/shutdown
+#
+# Trigger from the GitHub UI: Actions tab > Reboot Host > Run workflow.
+# You must type REBOOT in the confirmation field to proceed.
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type REBOOT to confirm (case-sensitive)'
+        required: true
+        type: string
+      reason:
+        description: 'Reason for reboot (logged on the host)'
+        required: false
+        default: 'manual remote reboot'
+        type: string
+
+# Only allow one reboot at a time.
+concurrency:
+  group: reboot-host
+  cancel-in-progress: false
+
+jobs:
+  reboot:
+    runs-on: [self-hosted, zeus-host]
+    timeout-minutes: 3
+    permissions:
+      contents: read
+    steps:
+      - name: Validate confirmation
+        run: |
+          if [ "${{ inputs.confirm }}" != "REBOOT" ]; then
+            echo "::error::Confirmation failed. You must type REBOOT exactly."
+            exit 1
+          fi
+
+      - name: Log trigger metadata
+        run: |
+          echo "Triggered by: ${{ github.actor }}"
+          echo "Reason:       ${{ inputs.reason }}"
+          echo "Time (UTC):   $(date -u -Iseconds)"
+          echo "Host:         $(hostname)"
+          echo "Uptime:       $(uptime)"
+
+      - name: Schedule reboot (+1 minute)
+        run: |
+          # Schedule 1 minute out so this job exits cleanly and reports
+          # success to GitHub before the runner is killed by the reboot.
+          msg="${{ inputs.reason }} (triggered by ${{ github.actor }} via GitHub Actions)"
+          sudo -n /sbin/shutdown -r +1 "$msg"
+          echo "Reboot scheduled for ~1 minute from now."
+          echo "The runner will go offline; it should re-register on boot if installed as a service."
